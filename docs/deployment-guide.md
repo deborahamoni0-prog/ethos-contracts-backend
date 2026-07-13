@@ -1,8 +1,8 @@
-# TTL-Legacy Deployment Guide
+# Ethos-Protocol Deployment Guide
 
 ## Overview
 
-This guide covers deploying TTL-Legacy to Stellar mainnet with security best practices, configuration, and rollback procedures.
+This guide covers deploying Ethos-Protocol to Stellar mainnet with security best practices, configuration, and rollback procedures.
 
 ## Prerequisites
 

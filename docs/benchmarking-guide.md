@@ -2,7 +2,7 @@
 
 ## Overview
 
-TTL-Legacy includes a comprehensive benchmarking suite using [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) to track contract performance and detect regressions.
+Ethos-Protocol includes a comprehensive benchmarking suite using [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) to track contract performance and detect regressions.
 
 ## Running Benchmarks
 

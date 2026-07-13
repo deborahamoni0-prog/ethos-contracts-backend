@@ -12,7 +12,7 @@ if [[ "$1" == "--force" ]]; then
   FORCE_DEPLOY=true
 fi
 
-echo "Deploying TTL-Legacy to $NETWORK..."
+echo "Deploying Ethos-Protocol to $NETWORK..."
 
 # Check for existing deployment
 EXISTING_CONTRACT=$(get_contract_address "$NETWORK")

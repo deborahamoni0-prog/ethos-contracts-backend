@@ -1,4 +1,4 @@
-# Contributing to TTL-Legacy
+# Contributing to Ethos-Protocol
 
 We welcome contributions! Please follow these guidelines to help us maintain project quality.
 

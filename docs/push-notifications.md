@@ -1,6 +1,6 @@
 # Push Notification Setup
 
-TTL-Legacy uses **Firebase Cloud Messaging (FCM) HTTP v1 API** to deliver push notifications to iOS, Android, and web clients.
+Ethos-Protocol uses **Firebase Cloud Messaging (FCM) HTTP v1 API** to deliver push notifications to iOS, Android, and web clients.
 
 ## Environment Variables
 

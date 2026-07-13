@@ -164,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           # Any deterministic 32-byte value works as a passkey hash in the smoke test
-          PASSKEY_HASH=$(echo -n "ttl-legacy-smoke-test" | sha256sum | awk '{print $1}')
+          PASSKEY_HASH=$(echo -n "ethos-protocol-smoke-test" | sha256sum | awk '{print $1}')
 
           stellar contract invoke \
             --id "${CONTRACT_ID}" \

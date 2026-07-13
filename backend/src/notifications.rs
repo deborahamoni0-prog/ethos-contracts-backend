@@ -154,7 +154,7 @@ fn notification_content(
         }
         NotificationType::CheckInReminder => (
             "🔔 Check-In Reminder",
-            "Time to check in to your TTL-Legacy vault.".to_string(),
+            "Time to check in to your Ethos-Protocol vault.".to_string(),
             json!({ "type": "check_in_reminder", "vault_id": vault_id }),
         ),
         NotificationType::VaultReleased => (

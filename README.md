@@ -1,14 +1,14 @@
-# TTL-Legacy — Micro-Endowment Check-In Vault on Stellar
+# Ethos-Protocol — Micro-Endowment Check-In Vault on Stellar
 
-[![CI](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml/badge.svg)](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml)
+[![CI](https://github.com/ethos-protocol/ethos-contracts-/actions/workflows/ci.yml/badge.svg)](https://github.com/ethos-protocol/ethos-contracts-/actions/workflows/ci.yml)
 
 A decentralized "Dead Man's Switch" built on Stellar/Soroban smart contracts.
 
-TTL-Legacy is a time-capsule vault where funds (XLM or tokenized assets) are released to a beneficiary only if the owner fails to "check in" via a Passkey-powered interface. It leverages Soroban's State Archival and TTL (Time to Live) features to automate asset inheritance — no seed phrase complexity required.
+Ethos-Protocol is a time-capsule vault where funds (XLM or tokenized assets) are released to a beneficiary only if the owner fails to "check in" via a Passkey-powered interface. It leverages Soroban's State Archival and TTL (Time to Live) features to automate asset inheritance — no seed phrase complexity required.
 
-## 🎯 What is TTL-Legacy?
+## 🎯 What is Ethos-Protocol?
 
-TTL-Legacy turns Stellar's native state archival mechanics into a programmable inheritance trigger. Vault owners:
+Ethos-Protocol turns Stellar's native state archival mechanics into a programmable inheritance trigger. Vault owners:
 
 - Deposit funds into a personal vault contract
 - Periodically "check in" to extend the contract's TTL and prove liveness
@@ -17,7 +17,7 @@ TTL-Legacy turns Stellar's native state archival mechanics into a programmable i
 
 If the owner stops checking in, the contract's TTL expires and the vault automatically releases funds to the beneficiary.
 
-This Soroban implementation makes TTL-Legacy:
+This Soroban implementation makes Ethos-Protocol:
 
 ✅ Trustless (no executor, lawyer, or coordinator needed)  
 ✅ Transparent (all vault state and transfers are on-chain)  

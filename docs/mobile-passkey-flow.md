@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes how WebAuthn/Passkey credentials are created, registered, and used across iOS and Android platforms in TTL-Legacy. It covers the complete flow from credential creation to authentication.
+This document describes how WebAuthn/Passkey credentials are created, registered, and used across iOS and Android platforms in Ethos-Protocol. It covers the complete flow from credential creation to authentication.
 
 ## Architecture
 
@@ -33,7 +33,7 @@ The registration process establishes a new passkey credential for vault owner au
                  │
     ┌────────────▼──────────────────────┐
     │ Send attestation + public key     │
-    │ to TTL-Legacy backend             │
+    │ to Ethos-Protocol backend             │
     └────────────┬─────────────────────┘
                  │
     ┌────────────▼──────────────────────┐
@@ -115,13 +115,13 @@ func registerPasskey(vaultId: String) async throws {
     let challenge = try await fetchRegistrationChallenge(vaultId: vaultId)
     
     // 2. Create platform authentication controller
-    let platformProvider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "ttl-legacy.app")
+    let platformProvider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "ethos-protocol.app")
     
     // 3. Create registration request
     let registrationRequest = platformProvider.createCredentialRegistrationRequest(
         userID: vaultId.data(using: .utf8)!,
         userName: "vault_owner_\(vaultId)",
-        displayName: "TTL-Legacy Vault \(vaultId)"
+        displayName: "Ethos-Protocol Vault \(vaultId)"
     )
     
     // 4. Set challenge (random data from server)
@@ -174,7 +174,7 @@ func authenticateWithPasskey(vaultId: String, action: String) async throws -> St
     let challenge = try await fetchAuthenticationChallenge(vaultId: vaultId, action: action)
     
     // 2. Create platform authentication provider
-    let platformProvider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "ttl-legacy.app")
+    let platformProvider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "ethos-protocol.app")
     
     // 3. Create assertion (signing) request
     let assertionRequest = platformProvider.createCredentialAssertionRequest(challenge: challenge.data(using: .utf8)!)
@@ -220,7 +220,7 @@ func authorizationController(
 
 ### Key Points (iOS)
 
-- **Relying Party ID**: Must match domain (e.g., "ttl-legacy.app")
+- **Relying Party ID**: Must match domain (e.g., "ethos-protocol.app")
 - **User ID**: Unique identifier per vault owner (not user's Stellar address)
 - **Private Key Storage**: Automatically managed by Secure Enclave on modern iPhones
 - **Biometric Requirement**: Face ID / Touch ID required at time of registration and authentication
@@ -285,13 +285,13 @@ private fun buildRegistrationJson(
     {
         "challenge": "$challenge",
         "rp": {
-            "name": "TTL-Legacy",
-            "id": "ttl-legacy.app"
+            "name": "Ethos-Protocol",
+            "id": "ethos-protocol.app"
         },
         "user": {
             "id": "$userId",
             "name": "$userName",
-            "displayName": "TTL-Legacy Vault $userId"
+            "displayName": "Ethos-Protocol Vault $userId"
         },
         "pubKeyCredParams": [
             {"alg": -7, "type": "public-key"},
@@ -317,7 +317,7 @@ suspend fun authenticateWithPasskey(vaultId: String, action: String): String {
     val getPublicKeyCredentialRequest = GetPublicKeyCredentialRequest(
         requestJson = buildAssertionJson(
             challenge = challenge,
-            relyingPartyId = "ttl-legacy.app"
+            relyingPartyId = "ethos-protocol.app"
         )
     )
     
@@ -387,7 +387,7 @@ pub async fn verify_registration(
     verify_challenge(&registration_response.client_data_json)?;
     
     // 2. Verify origin matches expected domain
-    verify_origin(&registration_response.client_data_json, "ttl-legacy.app")?;
+    verify_origin(&registration_response.client_data_json, "ethos-protocol.app")?;
     
     // 3. For optional attestation verification:
     // Verify the credential is from a trusted authenticator (e.g., Apple/Google)
@@ -421,7 +421,7 @@ pub async fn verify_authentication(
     verify_challenge(&auth_response.client_data_json)?;
     
     // 3. Verify origin matches expected domain
-    verify_origin(&auth_response.client_data_json, "ttl-legacy.app")?;
+    verify_origin(&auth_response.client_data_json, "ethos-protocol.app")?;
     
     // 4. Reconstruct signed data:
     // authenticatorData || sha256(clientDataJSON)
@@ -441,7 +441,7 @@ pub async fn verify_authentication(
 }
 ```
 
-## Integration with TTL-Legacy Smart Contract
+## Integration with Ethos-Protocol Smart Contract
 
 ### Public Key Registration
 

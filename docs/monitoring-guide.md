@@ -1,6 +1,6 @@
 # Monitoring & Alerting Guide
 
-This guide covers setting up Prometheus metrics collection and Grafana dashboards for TTL-Legacy.
+This guide covers setting up Prometheus metrics collection and Grafana dashboards for Ethos-Protocol.
 
 ## Overview
 
@@ -10,14 +10,14 @@ The backend exposes a `/metrics` endpoint in Prometheus text format. Grafana scr
 
 | Metric | Type | Description |
 |---|---|---|
-| `ttl_legacy_vaults_total` | Counter | Total vaults created |
-| `ttl_legacy_checkins_total` | Counter | Total check-ins performed |
-| `ttl_legacy_releases_total` | Counter | Total vault releases triggered |
-| `ttl_legacy_active_vaults` | Gauge | Currently active (non-released) vaults |
-| `ttl_legacy_request_errors_total` | Counter | Total API errors by endpoint |
-| `ttl_legacy_contract_paused` | Gauge | 1 if contract is paused, 0 otherwise |
-| `ttl_legacy_http_requests_total` | Counter | HTTP requests by method, path, status |
-| `ttl_legacy_http_request_duration_seconds` | Histogram | HTTP request latency |
+| `ethos_protocol_vaults_total` | Counter | Total vaults created |
+| `ethos_protocol_checkins_total` | Counter | Total check-ins performed |
+| `ethos_protocol_releases_total` | Counter | Total vault releases triggered |
+| `ethos_protocol_active_vaults` | Gauge | Currently active (non-released) vaults |
+| `ethos_protocol_request_errors_total` | Counter | Total API errors by endpoint |
+| `ethos_protocol_contract_paused` | Gauge | 1 if contract is paused, 0 otherwise |
+| `ethos_protocol_http_requests_total` | Counter | HTTP requests by method, path, status |
+| `ethos_protocol_http_request_duration_seconds` | Histogram | HTTP request latency |
 
 ## Prometheus Setup
 
@@ -40,7 +40,7 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: ttl-legacy-backend
+  - job_name: ethos-protocol-backend
     static_configs:
       - targets: ['localhost:8080']
     metrics_path: /metrics
@@ -48,7 +48,7 @@ scrape_configs:
 
 ### 3. Verify
 
-Open `http://localhost:9090` and query `ttl_legacy_vaults_total`.
+Open `http://localhost:9090` and query `ethos_protocol_vaults_total`.
 
 ## Grafana Setup
 
@@ -75,28 +75,28 @@ Default credentials: `admin` / `admin`.
 
 ```promql
 # Vault creation rate (per minute)
-rate(ttl_legacy_vaults_total[1m])
+rate(ethos_protocol_vaults_total[1m])
 
 # Active vaults
-ttl_legacy_active_vaults
+ethos_protocol_active_vaults
 ```
 
 #### Check-In Rate
 
 ```promql
 # Check-ins per minute
-rate(ttl_legacy_checkins_total[1m])
+rate(ethos_protocol_checkins_total[1m])
 ```
 
 #### Error Rate
 
 ```promql
 # API error rate
-rate(ttl_legacy_request_errors_total[5m])
+rate(ethos_protocol_request_errors_total[5m])
 
 # Error ratio
-rate(ttl_legacy_request_errors_total[5m])
-  / rate(ttl_legacy_http_requests_total[5m])
+rate(ethos_protocol_request_errors_total[5m])
+  / rate(ethos_protocol_http_requests_total[5m])
 ```
 
 ## Alerting Rules
@@ -105,12 +105,12 @@ Add to `prometheus.yml` or a separate `alerts.yml`:
 
 ```yaml
 groups:
-  - name: ttl-legacy
+  - name: ethos-protocol
     rules:
       - alert: HighErrorRate
         expr: |
-          rate(ttl_legacy_request_errors_total[5m])
-            / rate(ttl_legacy_http_requests_total[5m]) > 0.05
+          rate(ethos_protocol_request_errors_total[5m])
+            / rate(ethos_protocol_http_requests_total[5m]) > 0.05
         for: 2m
         labels:
           severity: warning
@@ -118,20 +118,20 @@ groups:
           summary: "High API error rate (>5%)"
 
       - alert: BackendDown
-        expr: up{job="ttl-legacy-backend"} == 0
+        expr: up{job="ethos-protocol-backend"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "TTL-Legacy backend is unreachable"
+          summary: "Ethos-Protocol backend is unreachable"
 
       - alert: ContractPaused
-        expr: ttl_legacy_contract_paused == 1
+        expr: ethos_protocol_contract_paused == 1
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "TTL-Legacy contract is paused"
+          summary: "Ethos-Protocol contract is paused"
 ```
 
 ### Grafana Alert (UI)

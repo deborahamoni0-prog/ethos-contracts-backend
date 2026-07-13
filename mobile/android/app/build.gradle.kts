@@ -8,16 +8,16 @@ plugins {
 }
 
 android {
-    namespace = "com.ttllegacy"
+    namespace = "com.ethosprotocol"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.ttllegacy"
+        applicationId = "com.ethosprotocol"
         minSdk = 28
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
-        buildConfigField("String", "API_BASE_URL", "\"https://api.ttl-legacy.app/v1\"")
+        buildConfigField("String", "API_BASE_URL", "\"https://api.ethos-protocol.app/v1\"")
     }
 
     buildFeatures { compose = true; buildConfig = true }

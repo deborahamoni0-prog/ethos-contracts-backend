@@ -1,6 +1,6 @@
-# TTL-Legacy Backend API Reference
+# Ethos-Protocol Backend API Reference
 
-This document provides a comprehensive reference for the TTL-Legacy backend server endpoints. The backend is a Rust-based Axum web service that manages reminder preferences, notifications, and system health checks for vault owners.
+This document provides a comprehensive reference for the Ethos-Protocol backend server endpoints. The backend is a Rust-based Axum web service that manages reminder preferences, notifications, and system health checks for vault owners.
 
 ---
 
@@ -475,7 +475,7 @@ By default, the backend uses an in-memory SQLite database (`:memory:`), which is
 **For persistent storage**, set:
 
 ```bash
-export DATABASE_URL="/path/to/ttl-legacy.db"
+export DATABASE_URL="/path/to/ethos-protocol.db"
 ```
 
 ### Health Checks
@@ -526,5 +526,5 @@ readinessProbe:
 
 For issues or questions:
 
-- **GitHub Issues**: https://github.com/TTL-Legacy/TTL-Legacy/issues
-- **Documentation**: https://github.com/TTL-Legacy/TTL-Legacy/blob/main/docs/
+- **GitHub Issues**: https://github.com/Ethos-Protocol/Ethos-Protocol/issues
+- **Documentation**: https://github.com/Ethos-Protocol/Ethos-Protocol/blob/main/docs/

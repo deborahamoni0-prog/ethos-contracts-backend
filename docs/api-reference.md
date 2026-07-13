@@ -1,4 +1,4 @@
-# TTL-Legacy Backend API Reference
+# Ethos-Protocol Backend API Reference
 
 Base URL: `http://localhost:3000`
 

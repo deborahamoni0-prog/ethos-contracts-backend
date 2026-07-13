@@ -75,7 +75,7 @@ fn generate_provisioning_uri(secret: &str, label: &str) -> String {
         })
         .collect();
     format!(
-        "otpauth://totp/{}?secret={}&issuer=TTL-Legacy&algorithm=SHA1&digits=6&period=30",
+        "otpauth://totp/{}?secret={}&issuer=Ethos-Protocol&algorithm=SHA1&digits=6&period=30",
         encoded_label, secret
     )
 }

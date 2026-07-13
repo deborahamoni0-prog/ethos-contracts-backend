@@ -3,17 +3,17 @@ version: '3.9'
 services:
   db:
     image: postgres:16-alpine
-    container_name: ttl-legacy-db
+    container_name: ethos-protocol-db
     environment:
-      POSTGRES_USER: ttl_user
-      POSTGRES_PASSWORD: ttl_password
-      POSTGRES_DB: ttl_legacy
+      POSTGRES_USER: ethos_user
+      POSTGRES_PASSWORD: ethos_password
+      POSTGRES_DB: ethos_protocol
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ttl_user -d ttl_legacy"]
+      test: ["CMD-SHELL", "pg_isready -U ethos_user -d ethos_protocol"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,9 +22,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: ttl-legacy-backend
+    container_name: ethos-protocol-backend
     environment:
-      DATABASE_URL: postgres://ttl_user:ttl_password@db:5432/ttl_legacy
+      DATABASE_URL: postgres://ethos_user:ethos_password@db:5432/ethos_protocol
       REDIS_URL: redis://redis:6379
       NODE_ID: backend-primary
       CONSENSUS_STRATEGY: last_write_wins
@@ -41,7 +41,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: ttl-legacy-redis
+    container_name: ethos-protocol-redis
     ports:
       - "6379:6379"
     healthcheck:

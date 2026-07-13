@@ -15,7 +15,7 @@ if [[ "$1" == "--force" ]]; then
   FORCE_DEPLOY=true
 fi
 
-echo "⚠️  You are about to deploy TTL-Legacy to MAINNET."
+echo "⚠️  You are about to deploy Ethos-Protocol to MAINNET."
 echo "    Network : $NETWORK"
 echo "    Identity: $DEPLOYER"
 echo "    RPC URL : $STELLAR_MAINNET_RPC_URL"

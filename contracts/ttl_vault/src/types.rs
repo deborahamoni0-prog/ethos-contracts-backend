@@ -293,7 +293,7 @@ pub const WITHDRAWAL_RATE_LIMITED_TOPIC: Symbol = symbol_short!("wd_rl");
 pub const WITHDRAWAL_ESCROW_CREATED_TOPIC: Symbol = symbol_short!("wd_esc");
 pub const WITHDRAWAL_ESCROW_VERIFIED_TOPIC: Symbol = symbol_short!("wd_ver");
 
-// Vault Partial Liquidation Before Release (TTL-Legacy);
+// Vault Partial Liquidation Before Release (Ethos-Protocol);
 // Emits (vault_id, amount, ttl_remaining_before). The TTL is intentionally
 // not extended on liquidation so the countdown keeps running.
 pub const PARTIAL_LIQUIDATE_TOPIC: Symbol = symbol_short!("part_lq");

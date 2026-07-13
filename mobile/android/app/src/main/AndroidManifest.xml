@@ -6,9 +6,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:name=".TTLLegacyApplication"
-        android:label="TTL-Legacy"
-        android:theme="@style/Theme.TTLLegacy"
+        android:name=".EthosProtocolApplication"
+        android:label="Ethos-Protocol"
+        android:theme="@style/Theme.EthosProtocol"
         android:allowBackup="false"
         android:supportsRtl="true">
 
@@ -24,24 +24,24 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Deep link: https://ttl-legacy.app/accept?vault_id=... (#838) -->
+            <!-- Deep link: https://ethos-protocol.app/accept?vault_id=... (#838) -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
                     android:scheme="https"
-                    android:host="ttl-legacy.app"
+                    android:host="ethos-protocol.app"
                     android:pathPrefix="/accept" />
             </intent-filter>
 
-            <!-- Deep link: ttllegacy://vault/{vault_id}/{action} (#964) -->
+            <!-- Deep link: ethosprotocol://vault/{vault_id}/{action} (#964) -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
-                    android:scheme="ttllegacy"
+                    android:scheme="ethosprotocol"
                     android:host="vault" />
             </intent-filter>
 

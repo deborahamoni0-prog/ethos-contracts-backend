@@ -2,7 +2,7 @@
 
 ## Overview
 
-The TTL-Legacy smart contract handles real XLM (Stellar Lumens) and implements time-locked vaults with beneficiary distributions. Security is critical to protect user funds and ensure the integrity of the contract.
+The Ethos-Protocol smart contract handles real XLM (Stellar Lumens) and implements time-locked vaults with beneficiary distributions. Security is critical to protect user funds and ensure the integrity of the contract.
 
 ## Supported Versions
 
@@ -23,8 +23,8 @@ We take security vulnerabilities seriously. If you discover a security vulnerabi
 
 Instead, please report vulnerabilities via one of the following methods:
 
-1. **Email**: Send details to [security@ttl-legacy.example.com](mailto:security@ttl-legacy.example.com)
-2. **Encrypted Communication**: Use our PGP key available at [https://ttl-legacy.example.com/security-key.asc](https://ttl-legacy.example.com/security-key.asc)
+1. **Email**: Send details to [security@ethos-protocol.example.com](mailto:security@ethos-protocol.example.com)
+2. **Encrypted Communication**: Use our PGP key available at [https://ethos-protocol.example.com/security-key.asc](https://ethos-protocol.example.com/security-key.asc)
 
 ### What to Include
 
@@ -89,7 +89,7 @@ Security updates and announcements will be published through:
 
 ## Contact
 
-For general security questions or concerns: [security@ttl-legacy.example.com](mailto:security@ttl-legacy.example.com)
+For general security questions or concerns: [security@ethos-protocol.example.com](mailto:security@ethos-protocol.example.com)
 
 ## Acknowledgments
 

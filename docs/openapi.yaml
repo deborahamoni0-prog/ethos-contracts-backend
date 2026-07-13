@@ -1,13 +1,13 @@
 openapi: 3.1.0
 info:
-  title: TTL-Legacy Backend API
+  title: Ethos-Protocol Backend API
   description: >
-    Backend API for TTL-Legacy, a decentralized "Dead Man's Switch" built on Stellar/Soroban.
+    Backend API for Ethos-Protocol, a decentralized "Dead Man's Switch" built on Stellar/Soroban.
     This API provides endpoints for vault management, reminder preferences, notifications, and administrative operations.
   version: 1.0.0
   contact:
-    name: TTL-Legacy Team
-    url: https://github.com/TTL-Legacy/TTL-Legacy
+    name: Ethos-Protocol Team
+    url: https://github.com/Ethos-Protocol/Ethos-Protocol
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -15,9 +15,9 @@ info:
 servers:
   - url: http://localhost:3000
     description: Local development server
-  - url: https://api.ttl-legacy.app
+  - url: https://api.ethos-protocol.app
     description: Production server
-  - url: https://testnet-api.ttl-legacy.app
+  - url: https://testnet-api.ethos-protocol.app
     description: Testnet server
 
 tags:

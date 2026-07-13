@@ -1,4 +1,4 @@
-title = "TTL-Legacy gitleaks config"
+title = "Ethos-Protocol gitleaks config"
 
 [allowlist]
   description = "Allow test/example values and documentation placeholders"

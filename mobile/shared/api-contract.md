@@ -1,6 +1,6 @@
-# TTL-Legacy Mobile API Contract
+# Ethos-Protocol Mobile API Contract
 
-Base URL: `https://api.ttl-legacy.app/v1` (configurable via env)
+Base URL: `https://api.ethos-protocol.app/v1` (configurable via env)
 
 ## Authentication
 All authenticated endpoints require `Authorization: Bearer <jwt>` header.
@@ -33,7 +33,7 @@ JWT is obtained via Passkey (WebAuthn) challenge/response flow.
 | DELETE | `/notifications/register` | Unregister push token |
 
 ## WebSocket
-`wss://api.ttl-legacy.app/v1/ws?vault_id={id}` — real-time vault events
+`wss://api.ethos-protocol.app/v1/ws?vault_id={id}` — real-time vault events
 
 ## Models
 
