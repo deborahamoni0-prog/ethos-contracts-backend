@@ -1,6 +1,6 @@
 # Ethos-Protocol — Micro-Endowment Check-In Vault on Stellar
 
-[![CI](https://github.com/ethos-protocol/ethos-contracts-/actions/workflows/ci.yml/badge.svg)](https://github.com/ethos-protocol/ethos-contracts-/actions/workflows/ci.yml)
+[![CI](https://github.com/ethos-protocol/ethos-contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/ethos-protocol/ethos-contracts/actions/workflows/ci.yml)
 
 A decentralized "Dead Man's Switch" built on Stellar/Soroban smart contracts.
 
