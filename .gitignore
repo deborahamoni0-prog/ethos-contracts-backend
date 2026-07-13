@@ -16,6 +16,9 @@ test_snapshots/
 .env.local
 .env.*.local
 
+# Local Stellar CLI identity/config store
+.soroban/
+
 # Editor / IDE
 .vscode/
 .idea/
