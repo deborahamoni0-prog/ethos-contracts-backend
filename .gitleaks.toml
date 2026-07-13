@@ -2,12 +2,13 @@ title = "Ethos-Protocol gitleaks config"
 
 [allowlist]
   description = "Allow test/example values and documentation placeholders"
+  # gitleaks `paths` entries are regexes, not globs.
   paths = [
-    "**/.env.example",
-    "**/README.md",
-    "**/docs/**",
-    "**/mobile/**",
-    "**/backend/src/websocket.rs"
+    '''\.env\.example$''',
+    '''README\.md$''',
+    '''docs/''',
+    '''mobile/''',
+    '''backend/src/websocket\.rs$'''
   ]
   regexes = [
     "test-secret-key-for-unit-tests",

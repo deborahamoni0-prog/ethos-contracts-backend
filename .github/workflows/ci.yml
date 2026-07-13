@@ -53,11 +53,16 @@ jobs:
         run: cargo audit --deny warnings
 
       - name: Scan for secrets with Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: detect --source . --config .gitleaks.toml --redact --fail
+        # gitleaks/gitleaks-action@v2 now gates organization repos behind a
+        # paid license (unrelated to this codebase - CI never ran long enough
+        # to reach this step before). The underlying gitleaks CLI is still
+        # free/open-source, so install and run it directly instead.
+        run: |
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar xz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks detect --source . --config .gitleaks.toml --redact --exit-code 1
 
       - name: Validate OpenAPI specification
         run: |
