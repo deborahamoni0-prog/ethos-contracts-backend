@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracterror, panic_with_error, symbol_short, Bytes, BytesN, Env,
+    contract, contracterror, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN,
+    Env,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
@@ -21,6 +22,25 @@ pub enum VerifierError {
     ProofTooLarge = 3,
     /// Claim bytes exceed MAX_CLAIM_SIZE.
     ClaimTooLarge = 4,
+    /// Contract has already been initialized.
+    AlreadyInitialized = 5,
+    /// Contract has not been initialized.
+    NotInitialized = 6,
+    /// The oracle address is not registered.
+    OracleNotFound = 7,
+}
+
+/// Storage key discriminants.
+mod keys {
+    use soroban_sdk::{contracttype, Address, BytesN};
+
+    #[contracttype]
+    pub enum DataKey {
+        Admin,
+        Oracle(Address),
+        /// Attestation: (proof_sha256, claim_sha256) -> attesting oracle
+        Attestation(BytesN<32>, BytesN<32>),
+    }
 }
 
 use keys::DataKey;
@@ -42,7 +62,9 @@ impl ZkVerifierContract {
     /// Register a trusted oracle. Admin only.
     pub fn register_oracle(env: Env, oracle: Address) {
         Self::require_admin(&env);
-        env.storage().instance().set(&DataKey::Oracle(oracle), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Oracle(oracle), &true);
     }
 
     /// Revoke a trusted oracle. Admin only.
@@ -53,7 +75,10 @@ impl ZkVerifierContract {
 
     /// Returns whether the given address is a registered oracle.
     pub fn is_oracle(env: Env, oracle: Address) -> bool {
-        env.storage().instance().get::<DataKey, bool>(&DataKey::Oracle(oracle)).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Oracle(oracle))
+            .unwrap_or(false)
     }
 
     /// An oracle publishes an attestation that `proof` is valid for `claim`.
@@ -67,16 +92,20 @@ impl ZkVerifierContract {
         if claim.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyClaim);
         }
-        if !env.storage().instance().get::<DataKey, bool>(&DataKey::Oracle(oracle.clone())).unwrap_or(false) {
+        if !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
+            .unwrap_or(false)
+        {
             panic_with_error!(&env, VerifierError::OracleNotFound);
         }
         oracle.require_auth();
         let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
-        env.storage().instance().set(
-            &DataKey::Attestation(proof_hash, claim_hash),
-            &oracle,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Attestation(proof_hash, claim_hash), &oracle);
     }
 
     /// Verifies a zero-knowledge proof against a claim using oracle attestation.
@@ -104,10 +133,22 @@ impl ZkVerifierContract {
         // Real ZK verification would replace this with cryptographic validation.
         let result = !(proof.len() == 1 && proof.get(0) == Some(0x00));
 
-        let claim_hash: BytesN<32> = env.crypto().sha256(&claim);
-        env.events().publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
+        let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
+        env.events()
+            .publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
 
         result
+    }
+
+    // ---- helpers ----
+
+    fn require_admin(env: &Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, VerifierError::NotInitialized));
+        admin.require_auth();
     }
 }
 

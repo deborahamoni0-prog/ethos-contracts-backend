@@ -46,12 +46,20 @@ fn test_create_pool_success() {
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
 
-    let vault_id = client.create_vault(&owner, &b1, &100);
+    let vault_id = client.create_vault(&owner, &b1, &100, &None);
 
     let entries = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 6000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b2.clone(), bps: 4000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 6000,
+            minimum_threshold: 0,
+        },
+        BeneficiaryEntry {
+            address: b2.clone(),
+            bps: 4000,
+            minimum_threshold: 0,
+        },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
@@ -71,12 +79,20 @@ fn test_create_pool_partial_members() {
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
 
-    let vault_id = client.create_vault(&owner, &b1, &100);
+    let vault_id = client.create_vault(&owner, &b1, &100, &None);
 
     let entries = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 6000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b2.clone(), bps: 4000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 6000,
+            minimum_threshold: 0,
+        },
+        BeneficiaryEntry {
+            address: b2.clone(),
+            bps: 4000,
+            minimum_threshold: 0,
+        },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
@@ -95,11 +111,15 @@ fn test_create_pool_rejects_unregistered_member() {
     let b1 = Address::generate(&env);
     let stranger = Address::generate(&env);
 
-    let vault_id = client.create_vault(&owner, &b1, &100);
+    let vault_id = client.create_vault(&owner, &b1, &100, &None);
 
     let entries = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 10_000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 10_000,
+            minimum_threshold: 0,
+        },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
@@ -116,11 +136,15 @@ fn test_create_pool_rejects_non_owner() {
     let b1 = Address::generate(&env);
     let impostor = Address::generate(&env);
 
-    let vault_id = client.create_vault(&owner, &b1, &100);
+    let vault_id = client.create_vault(&owner, &b1, &100, &None);
 
     let entries = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 10_000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 10_000,
+            minimum_threshold: 0,
+        },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 

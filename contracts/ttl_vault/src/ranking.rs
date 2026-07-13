@@ -43,8 +43,7 @@ pub fn set_rank(env: &Env, caller: &Address, beneficiary: Address, priority: u32
 
     let allocation_bps = ranks
         .get(beneficiary.clone())
-        .map(|b| b.allocation_bps)
-        .unwrap_or(10_000);
+        .map_or(10_000, |b| b.allocation_bps);
 
     ranks.set(
         beneficiary.clone(),
@@ -109,18 +108,23 @@ pub fn distribute_by_rank(env: &Env, total_amount: i128) -> Map<Address, i128> {
             total_bps = total_bps.saturating_add(beneficiary.allocation_bps);
         }
 
+        // Distribute proportionally to `allocation_bps` within this tier. `total_bps` is
+        // decremented alongside `remaining` as each beneficiary is paid, so the ratio
+        // applied to what's left stays consistent instead of compounding shrinkage.
+        let mut tier_remaining_bps = total_bps;
         for beneficiary in tier.iter() {
             if remaining <= 0 {
                 break;
             }
-            let amount = if total_bps == 0 {
+            let amount = if tier_remaining_bps == 0 {
                 0
             } else {
-                (remaining * beneficiary.allocation_bps as i128) / total_bps as i128
+                (remaining * beneficiary.allocation_bps as i128) / tier_remaining_bps as i128
             };
             let amount = amount.min(remaining);
             distributions.set(beneficiary.address.clone(), amount);
             remaining -= amount;
+            tier_remaining_bps = tier_remaining_bps.saturating_sub(beneficiary.allocation_bps);
             env.events().publish(
                 (DISTRIBUTED_BY_RANK_TOPIC,),
                 DistributedByRankEvent {
@@ -149,14 +153,14 @@ mod tests {
     fn higher_priority_receives_before_lower_priority() {
         let env = Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
         let admin = Address::generate(&env);
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
 
-        set_rank(&env, &admin, alice.clone(), 1);
-        set_rank(&env, &admin, bob.clone(), 2);
-
-        let result = distribute_by_rank(&env, 500);
+        env.as_contract(&contract_id, || set_rank(&env, &admin, alice.clone(), 1));
+        env.as_contract(&contract_id, || set_rank(&env, &admin, bob.clone(), 2));
+        let result = env.as_contract(&contract_id, || distribute_by_rank(&env, 500));
 
         assert_eq!(result.get(alice).unwrap(), 500);
         assert_eq!(result.get(bob).unwrap_or(0), 0);
@@ -166,14 +170,14 @@ mod tests {
     fn same_priority_splits_by_allocation_bps() {
         let env = Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
         let admin = Address::generate(&env);
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
 
-        set_rank(&env, &admin, alice.clone(), 1);
-        set_rank(&env, &admin, bob.clone(), 1);
-
-        let result = distribute_by_rank(&env, 1_000);
+        env.as_contract(&contract_id, || set_rank(&env, &admin, alice.clone(), 1));
+        env.as_contract(&contract_id, || set_rank(&env, &admin, bob.clone(), 1));
+        let result = env.as_contract(&contract_id, || distribute_by_rank(&env, 1_000));
 
         assert_eq!(result.get(alice).unwrap(), 500);
         assert_eq!(result.get(bob).unwrap(), 500);
@@ -183,22 +187,21 @@ mod tests {
     fn ranking_set_event_is_emitted() {
         let env = Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
         let admin = Address::generate(&env);
         let alice = Address::generate(&env);
 
-        set_rank(&env, &admin, alice, 1);
+        env.as_contract(&contract_id, || {
+            set_rank(&env, &admin, alice, 1);
+        });
 
-        assert!(env
-            .events()
-            .all()
-            .iter()
-            .any(|event| {
-                let topics: Vec<Val> = event.1.clone().into_val(&env);
-                topics
-                    .get(0)
-                    .and_then(|topic| topic.try_into_val(&env).ok())
-                    .map(|topic: soroban_sdk::Symbol| topic == RANKING_SET_TOPIC)
-                    .unwrap_or(false)
-            }));
+        assert!(env.events().all().iter().any(|event| {
+            let topics: Vec<Val> = event.1.clone().into_val(&env);
+            topics
+                .get(0)
+                .and_then(|topic| topic.try_into_val(&env).ok())
+                .map(|topic: soroban_sdk::Symbol| topic == RANKING_SET_TOPIC)
+                .unwrap_or(false)
+        }));
     }
 }

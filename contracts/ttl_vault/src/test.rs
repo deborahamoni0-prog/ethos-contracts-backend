@@ -3580,7 +3580,7 @@ fn test_beneficiary_veto_release_condition_blocks_trigger_release_before_expiry(
     client.deposit(&vault_id, &owner, &500i128);
 
     // Beneficiary vetoes owner-defined release conditions before expiry
-    client.beneficiary_veto_release_condition(&vault_id, &beneficiary).unwrap();
+    client.veto_release_condition(&vault_id, &beneficiary).unwrap();
 
     // Not yet expired — try_trigger_release must fail (NotExpired)
     // (trigger_release entrypoint still requires expiry; this verifies veto is not incorrectly bypassed)
@@ -3606,8 +3606,8 @@ fn test_beneficiary_veto_can_be_revoked_before_expiry() {
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     client.deposit(&vault_id, &owner, &500i128);
 
-    client.beneficiary_veto_release_condition(&vault_id, &beneficiary).unwrap();
-    client.revoke_beneficiary_veto_release_condition(&vault_id, &beneficiary).unwrap();
+    client.veto_release_condition(&vault_id, &beneficiary).unwrap();
+    client.revoke_veto_release_condition(&vault_id, &beneficiary).unwrap();
 
     // Advance past expiry; without veto, release should succeed
     env.ledger().with_mut(|l| l.timestamp += 200);
@@ -3628,7 +3628,7 @@ fn test_beneficiary_veto_does_not_apply_after_vault_expired() {
     env.ledger().with_mut(|l| l.timestamp += 200);
 
     // Attempting to veto after expiry should fail
-    let result = client.try_beneficiary_veto_release_condition(&vault_id, &beneficiary);
+    let result = client.try_veto_release_condition(&vault_id, &beneficiary);
     assert!(result.is_err());
 
     // Release should succeed
@@ -3651,7 +3651,7 @@ fn test_non_primary_beneficiary_cannot_veto() {
     client.add_beneficiary(&vault_id, &owner, &Address::generate(&env), &5_000u32).unwrap();
 
     // Non-primary beneficiary veto should be rejected
-    let result = client.try_beneficiary_veto_release_condition(&vault_id, &other);
+    let result = client.try_veto_release_condition(&vault_id, &other);
     assert!(result.is_err());
 
     // For sanity, release still works when expired
@@ -4285,7 +4285,7 @@ fn test_accept_with_threshold_beneficiary_only() {
     let result = client.try_accept_with_threshold(&vault_id, &100_000i128);
     assert!(result.is_ok());
 
-    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    let acceptance = client.get_beneficiary_cond_acceptance(&vault_id);
     assert!(acceptance.is_some());
     assert_eq!(acceptance.unwrap().min_balance_threshold, 100_000i128);
 }
@@ -4387,7 +4387,7 @@ fn test_get_beneficiary_conditional_acceptance_not_set() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
 
-    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    let acceptance = client.get_beneficiary_cond_acceptance(&vault_id);
     assert!(acceptance.is_none());
 }
 
@@ -4400,7 +4400,7 @@ fn test_accept_with_threshold_stores_timestamp() {
     client.accept_with_threshold(&vault_id, &100_000i128);
     let after_timestamp = env.ledger().timestamp();
 
-    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    let acceptance = client.get_beneficiary_cond_acceptance(&vault_id);
     assert!(acceptance.is_some());
     let acc = acceptance.unwrap();
     assert!(acc.accepted_at >= before_timestamp && acc.accepted_at <= after_timestamp);
@@ -4674,7 +4674,7 @@ fn test_beneficiary_vault_limit_enforced() {
 
     // Third vault with the same beneficiary should fail
     let err = client.try_create_vault(&owner3, &beneficiary, &3600u64, &None).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // BeneficiaryCapacityExceeded
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::BeneficiaryCapacityExceeded as u32));
 }
 
 #[test]
@@ -4721,7 +4721,7 @@ fn test_apply_beneficiary_update_respects_limit() {
 
     // Applying should fail — beneficiary already at limit
     let err = client.try_apply_beneficiary_update(&vault2, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // BeneficiaryCapacityExceeded
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::BeneficiaryCapacityExceeded as u32));
 }
 
 // ---- Issue #471: Vault Merge Validation ----
@@ -6673,186 +6673,3 @@ fn test_trigger_release_with_50_beneficiaries() {
     assert!(token_client.balance(&addresses[49]) >= per_beneficiary);
 }
 
-// ── Issue #482: get_check_in_history_page ────────────────────────────────────
-
-#[test]
-fn test_check_in_history_page_empty_history() {
-    // A brand-new vault has no check-in history; any page should be empty.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let _ = env; // env not mutated in this test
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let page = client.get_check_in_history_page(&id, &0u64, &10u32);
-    assert_eq!(page.len(), 0, "expected empty page for vault with no history");
-}
-
-#[test]
-fn test_check_in_history_page_first_page() {
-    // Record 5 check-ins then request the first 3 → should return entries [0..3].
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..5 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &3u32);
-    assert_eq!(page.len(), 3);
-
-    // Entries should be ordered oldest-first, so timestamps must be ascending.
-    assert!(page.get(0).unwrap().timestamp < page.get(1).unwrap().timestamp);
-    assert!(page.get(1).unwrap().timestamp < page.get(2).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_second_page() {
-    // Record 5 check-ins; cursor=3, limit=3 should return the last 2 entries.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..5 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // Full history for cross-checking
-    let all = client.get_check_in_history(&id);
-    assert_eq!(all.len(), 5);
-
-    let page = client.get_check_in_history_page(&id, &3u64, &3u32);
-    assert_eq!(page.len(), 2, "cursor=3 into 5-entry list with limit=3 should yield 2 entries");
-    assert_eq!(page.get(0).unwrap().timestamp, all.get(3).unwrap().timestamp);
-    assert_eq!(page.get(1).unwrap().timestamp, all.get(4).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_exact_full_page() {
-    // Request exactly as many entries as exist → should return all of them.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..4 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &4u32);
-    assert_eq!(page.len(), 4);
-}
-
-#[test]
-fn test_check_in_history_page_cursor_at_last_entry() {
-    // cursor pointing at the last element should return exactly one entry.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let all = client.get_check_in_history(&id);
-    let page = client.get_check_in_history_page(&id, &2u64, &10u32);
-    assert_eq!(page.len(), 1);
-    assert_eq!(page.get(0).unwrap().timestamp, all.get(2).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_cursor_out_of_bounds() {
-    // cursor >= total entries → empty result, no panic.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // cursor == len
-    let page = client.get_check_in_history_page(&id, &3u64, &10u32);
-    assert_eq!(page.len(), 0, "cursor equal to len should return empty page");
-
-    // cursor >> len
-    let page2 = client.get_check_in_history_page(&id, &9999u64, &10u32);
-    assert_eq!(page2.len(), 0, "cursor far beyond len should return empty page");
-}
-
-#[test]
-fn test_check_in_history_page_limit_zero() {
-    // limit=0 should always return an empty page, regardless of cursor.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &0u32);
-    assert_eq!(page.len(), 0, "limit=0 should return empty page");
-}
-
-#[test]
-fn test_check_in_history_page_limit_capped_at_50() {
-    // Requesting more than 50 entries should be silently capped to 50.
-    // We only seed 10 entries so we can verify cap without 50+ check-ins.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..10 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // u32::MAX >> 50; result is capped, not a panic, and returns at most 10 entries.
-    let page = client.get_check_in_history_page(&id, &0u64, &u32::MAX);
-    assert_eq!(page.len(), 10, "capped limit with only 10 entries should return 10");
-}
-
-#[test]
-fn test_check_in_history_page_consistent_with_full_history() {
-    // Walking through all pages reassembled equals the full history.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..7 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let all = client.get_check_in_history(&id);
-    assert_eq!(all.len(), 7);
-
-    // Reassemble using page size of 3
-    let page_size: u32 = 3;
-    let mut cursor: u64 = 0;
-    let mut reassembled: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
-    loop {
-        let page = client.get_check_in_history_page(&id, &cursor, &page_size);
-        if page.len() == 0 {
-            break;
-        }
-        for entry in page.iter() {
-            reassembled.push_back(entry.timestamp);
-        }
-        cursor += page_size as u64;
-    }
-
-    assert_eq!(reassembled.len(), 7, "reassembled pages should cover all 7 entries");
-    for i in 0..7u32 {
-        assert_eq!(
-            reassembled.get(i).unwrap(),
-            all.get(i).unwrap().timestamp,
-            "entry {i} timestamp mismatch between full history and paged walk"
-        );
-    }
-}

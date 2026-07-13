@@ -9,10 +9,13 @@ use serde::Deserialize;
 
 use crate::{
     audit,
-    db::Db,
+    db::{AppState, Db},
     error::AppError,
     handlers::{parse_scenario_types, simulate_release_handler},
-    models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
+    models::{
+        ReminderPreferences, SetPreferencesRequest, SetSubscriptionRequest, SimulateReleaseQuery,
+        SimulateReleaseResponse, Subscription,
+    },
 };
 
 #[derive(Deserialize)]
@@ -122,7 +125,6 @@ pub async fn unsubscribe(
     }
 }
 
-
 // ── Release Simulator endpoint ────────────────────────────────────────────────
 
 /// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
@@ -140,13 +142,38 @@ pub async fn simulate_release(
 
     let missed_count = query.missed_count.unwrap_or(1);
 
-    let result = simulate_release_handler(
-        &db.vault_store,
-        &vault_id,
-        scenarios,
-        missed_count,
-    )
-    .map_err(|_| AppError::NotFound)?;
+    let result = simulate_release_handler(&db.vault_store, &vault_id, scenarios, missed_count)
+        .map_err(|_| AppError::NotFound)?;
 
     Ok(Json(result))
+}
+
+// ── Vault Notification Subscription Handlers ────────────────────────────────
+
+pub async fn set_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+    Json(body): Json<SetSubscriptionRequest>,
+) -> Result<(StatusCode, Json<Subscription>), AppError> {
+    if body.channels.is_empty() {
+        return Err(AppError::InvalidInput("channels must not be empty".into()));
+    }
+
+    let sub = Subscription {
+        vault_id,
+        owner: body.owner,
+        channels: body.channels,
+        frequency: body.frequency,
+    };
+    state.db.upsert_subscription(&sub)?;
+
+    Ok((StatusCode::OK, Json(sub)))
+}
+
+pub async fn delete_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<StatusCode, AppError> {
+    state.db.delete_subscription(vault_id)?;
+    Ok(StatusCode::NO_CONTENT)
 }

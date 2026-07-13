@@ -25,7 +25,7 @@ proptest! {
     ) {
         let mut balance = initial_balance;
         let mut total_deposits = 0i128;
-        
+
         for op in ops {
             match op {
                 VaultOp::Deposit(amount) => {
@@ -44,7 +44,7 @@ proptest! {
                 }
             }
         }
-        
+
         // Invariant: balance never exceeds initial + total deposits
         let max_balance = initial_balance.saturating_add(total_deposits);
         prop_assert!(balance <= max_balance);
@@ -57,11 +57,11 @@ proptest! {
         num_check_ins in 1usize..20,
     ) {
         let mut ttl = base_ttl;
-        
+
         for _ in 0..num_check_ins {
             let old_ttl = ttl;
             ttl = ttl.saturating_add(check_in_interval);
-            
+
             // Invariant: TTL must increase or stay same on check-in
             prop_assert!(ttl >= old_ttl);
         }
@@ -77,11 +77,11 @@ proptest! {
             Expired,
             Released,
         }
-        
+
         let mut status = Status::Active;
         let mut ttl = 86400u64; // 1 day
         let mut check_in_interval = 86400u64;
-        
+
         for op in ops {
             match op {
                 VaultOp::CheckIn => {
@@ -103,7 +103,7 @@ proptest! {
                 }
             }
         }
-        
+
         // Invariant: status should be valid
         prop_assert!(matches!(status, Status::Active | Status::Expired | Status::Released));
     }
@@ -114,12 +114,13 @@ proptest! {
     ) {
         let mut released = false;
         let mut release_count = 0;
-        
+
         for op in ops {
             match op {
                 VaultOp::CheckIn => {
-                    // Check-in prevents release
-                    released = false;
+                    // Mirrors the real contract: check_in is rejected once a vault's
+                    // status is Released (ReleaseStatus::Locked guard), so a released
+                    // vault can never be "un-released" by a later check-in.
                 }
                 VaultOp::Deposit(_) | VaultOp::Withdraw(_) => {
                     if !released {
@@ -130,7 +131,7 @@ proptest! {
                 }
             }
         }
-        
+
         // Invariant: funds should only be released once
         prop_assert!(release_count <= 1);
     }
@@ -144,9 +145,10 @@ const MAX_PERSISTENT_TTL: u32 = 3_110_400;
 const LEDGER_SECOND: u32 = 5;
 
 fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
-    let ledgers = (check_in_interval as u32)
-        .saturating_mul(2)
-        .saturating_div(LEDGER_SECOND);
+    // Saturate rather than truncate: `as u32` on a u64 wraps around instead of
+    // clamping, which broke monotonicity for check_in_interval > u32::MAX.
+    let interval_u32 = check_in_interval.min(u32::MAX as u64) as u32;
+    let ledgers = interval_u32.saturating_mul(2).saturating_div(LEDGER_SECOND);
     ledgers.clamp(VAULT_TTL_LEDGERS_MIN, MAX_PERSISTENT_TTL)
 }
 

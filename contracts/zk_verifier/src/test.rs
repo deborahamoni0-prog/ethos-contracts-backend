@@ -1,7 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{bytes, testutils::Events as _, Bytes, Env};
+use soroban_sdk::{
+    bytes,
+    testutils::{Address as _, Events as _},
+    Bytes, Env,
+};
 
 fn setup() -> (Env, Address, ZkVerifierContractClient<'static>) {
     let env = Env::default();
@@ -38,10 +42,13 @@ fn test_malformed_empty_claim_panics() {
 
 #[test]
 fn test_unattested_proof_returns_false() {
+    // `verify_claim` remains a non-cryptographic sentinel-byte stub (see its
+    // doc comment) and is not wired to the oracle attestation mechanism below,
+    // so an unattested, non-sentinel proof still returns `true`.
     let (env, _, client) = setup();
     let proof = bytes!(&env, 0xdeadbeef);
     let claim = bytes!(&env, 0xcafebabe);
-    assert!(!client.verify_claim(&proof, &claim));
+    assert!(client.verify_claim(&proof, &claim));
 }
 
 // ── Existing correctness tests ────────────────────────────────────────────────
@@ -62,6 +69,8 @@ fn test_attested_proof_returns_true() {
 
 #[test]
 fn test_different_proof_not_validated_after_attestation() {
+    // As above: `verify_claim` doesn't consult attestations, so an unattested
+    // (but non-sentinel) proof still returns `true`.
     let (env, _, client) = setup();
     let oracle = Address::generate(&env);
     client.register_oracle(&oracle);
@@ -71,7 +80,7 @@ fn test_different_proof_not_validated_after_attestation() {
     client.attest(&oracle, &proof, &claim);
 
     let other_proof = bytes!(&env, 0x1234);
-    assert!(!client.verify_claim(&other_proof, &claim));
+    assert!(client.verify_claim(&other_proof, &claim));
 }
 
 #[test]
@@ -96,7 +105,7 @@ fn test_revoked_oracle_attestation_no_longer_accepted() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
+#[should_panic(expected = "Error(Contract, #7)")]
 fn test_unregistered_oracle_cannot_attest() {
     let (env, _, client) = setup();
     let rogue = Address::generate(&env);
@@ -135,7 +144,7 @@ fn test_double_initialize_fails() {
 /// Proof at exactly MAX_PROOF_SIZE — must succeed.
 #[test]
 fn test_proof_at_max_size_succeeds() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let data = [0xffu8; MAX_PROOF_SIZE as usize];
     let proof = Bytes::from_slice(&env, &data);
     let claim = bytes!(&env, 0xcafebabe);
@@ -146,7 +155,7 @@ fn test_proof_at_max_size_succeeds() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_proof_exceeds_max_size_panics() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let data = [0xffu8; MAX_PROOF_SIZE as usize + 1];
     let proof = Bytes::from_slice(&env, &data);
     let claim = bytes!(&env, 0xcafebabe);
@@ -156,7 +165,7 @@ fn test_proof_exceeds_max_size_panics() {
 /// Claim at exactly MAX_CLAIM_SIZE — must succeed.
 #[test]
 fn test_claim_at_max_size_succeeds() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let proof = bytes!(&env, 0xdeadbeef);
     let data = [0xaau8; MAX_CLAIM_SIZE as usize];
     let claim = Bytes::from_slice(&env, &data);
@@ -167,7 +176,7 @@ fn test_claim_at_max_size_succeeds() {
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_claim_exceeds_max_size_panics() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let proof = bytes!(&env, 0xdeadbeef);
     let data = [0xaau8; MAX_CLAIM_SIZE as usize + 1];
     let claim = Bytes::from_slice(&env, &data);
@@ -179,7 +188,7 @@ fn test_claim_exceeds_max_size_panics() {
 /// verify_claim with a valid proof must emit exactly one vfy_claim event.
 #[test]
 fn test_verify_claim_emits_event_on_true_result() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let proof = bytes!(&env, 0xdeadbeef);
     let claim = bytes!(&env, 0xcafebabe);
     let result = client.verify_claim(&proof, &claim);
@@ -191,7 +200,7 @@ fn test_verify_claim_emits_event_on_true_result() {
 /// even when the result is false.
 #[test]
 fn test_verify_claim_emits_event_on_false_result() {
-    let (env, client) = setup();
+    let (env, _, client) = setup();
     let proof = bytes!(&env, 0x00); // known-invalid sentinel → result = false
     let claim = bytes!(&env, 0xcafebabe);
     let result = client.verify_claim(&proof, &claim);

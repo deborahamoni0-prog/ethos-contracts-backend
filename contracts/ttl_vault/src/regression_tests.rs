@@ -4,9 +4,12 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::{Instance as _, Persistent as _}, Address as _, Events, Ledger},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events, Ledger,
+    },
     token::{self, StellarAssetClient},
-    vec, Address, BytesN, Env, IntoVal, TryIntoVal,
+    vec, Address, BytesN, Env, IntoVal, TryIntoVal, Val,
 };
 
 fn setup() -> (
@@ -67,16 +70,24 @@ fn regression_checkin_extends_ttl() {
     let (env, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    
+
+    env.ledger().with_mut(|l| l.timestamp += 500);
     let ttl_before = client.get_ttl_remaining(&vault_id);
     assert!(ttl_before.is_some(), "TTL should exist after creation");
 
-    env.ledger().set_sequence_number(env.ledger().sequence() + 500);
-    client.check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64);
+    client.check_in(
+        &vault_id,
+        &owner,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &0u64,
+    );
 
     let ttl_after = client.get_ttl_remaining(&vault_id);
     assert!(ttl_after.is_some(), "TTL should exist after check-in");
-    assert!(ttl_after > ttl_before, "TTL should be extended after check-in");
+    assert!(
+        ttl_after > ttl_before,
+        "TTL should be extended after check-in"
+    );
 }
 
 #[test]
@@ -88,7 +99,9 @@ fn passkey_biometric_bind_and_checkin() {
     let beneficiary = Address::generate(&env);
     let admin = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_address = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
 
     // Initialize contract
     let contract_address = env.register_contract(None, TtlVaultContract);
@@ -112,7 +125,9 @@ fn passkey_biometric_bind_and_checkin() {
     // Verify passkey record contains biometric binding
     let passkeys = client.get_vault_passkeys(&vault_id);
     assert!(passkeys.len() > 0);
-    let found = passkeys.iter().any(|p| p.hash == passkey_hash && p.biometric_hash.is_some());
+    let found = passkeys
+        .iter()
+        .any(|p| p.hash == passkey_hash && p.biometric_hash.is_some());
     assert!(found, "Biometric binding should be present on the passkey");
 
     // Verify events were emitted
@@ -121,7 +136,7 @@ fn passkey_biometric_bind_and_checkin() {
     let mut saw_bio_ci = false;
     for e in events.iter() {
         let topics: soroban_sdk::Vec<Val> = e.1.clone().into_val(&env);
-        if let Ok(sym) = topics.get(0).and_then(|t| t.try_into_val(&env)) {
+        if let Some(Ok(sym)) = topics.get(0).map(|t| t.try_into_val(&env)) {
             let s: soroban_sdk::Symbol = sym;
             if s == BIND_PASSKEY_BIOMETRIC_TOPIC {
                 saw_bind = true;
@@ -142,15 +157,18 @@ fn regression_deposit_updates_balance() {
     let (env, owner, beneficiary, _, token_address, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    
+
     let balance_before = client.get_vault_balance(&vault_id);
     assert_eq!(balance_before, 0, "Initial balance should be zero");
 
     let deposit_amount = 100_000i128;
-    client.deposit(&vault_id, &deposit_amount);
+    client.deposit(&vault_id, &owner, &deposit_amount);
 
     let balance_after = client.get_vault_balance(&vault_id);
-    assert_eq!(balance_after, deposit_amount, "Balance should increase by deposit amount");
+    assert_eq!(
+        balance_after, deposit_amount,
+        "Balance should increase by deposit amount"
+    );
 }
 
 /// Regression test: Ensure withdrawal decreases vault balance
@@ -161,11 +179,11 @@ fn regression_withdrawal_updates_balance() {
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
     let deposit_amount = 100_000i128;
-    client.deposit(&vault_id, &deposit_amount);
+    client.deposit(&vault_id, &owner, &deposit_amount);
 
     let balance_before = client.get_vault_balance(&vault_id);
     let withdrawal_amount = 30_000i128;
-    client.withdraw(&vault_id, &withdrawal_amount);
+    client.withdraw(&vault_id, &owner, &withdrawal_amount);
 
     let balance_after = client.get_vault_balance(&vault_id);
     assert_eq!(
@@ -182,10 +200,13 @@ fn regression_withdrawal_exceeds_balance_rejected() {
     let (_, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    client.deposit(&vault_id, &50_000i128);
+    client.deposit(&vault_id, &owner, &50_000i128);
 
-    let result = client.try_withdraw(&vault_id, &100_000i128);
-    assert!(result.is_err(), "Withdrawal exceeding balance should be rejected");
+    let result = client.try_withdraw(&vault_id, &owner, &100_000i128);
+    assert!(
+        result.is_err(),
+        "Withdrawal exceeding balance should be rejected"
+    );
 }
 
 /// Regression test: Ensure beneficiary update works correctly
@@ -195,12 +216,19 @@ fn regression_beneficiary_update_persists() {
     let (env, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    
+
     let new_beneficiary = Address::generate(&env);
-    client.update_beneficiary(&vault_id, &new_beneficiary);
+    // Beneficiary updates are timelocked (24h): initiate, advance past the
+    // timelock, then apply.
+    client.update_beneficiary(&vault_id, &owner, &new_beneficiary);
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    client.apply_beneficiary_update(&vault_id, &owner);
 
     let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.beneficiary, new_beneficiary, "Beneficiary should be updated");
+    assert_eq!(
+        vault.beneficiary, new_beneficiary,
+        "Beneficiary should be updated"
+    );
 }
 
 /// Regression test: Ensure only owner can check in
@@ -210,14 +238,22 @@ fn regression_only_owner_can_checkin() {
     let (env, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    
+
     let unauthorized_user = Address::generate(&env);
     env.mock_all_auths_allowing_non_root_auth();
 
-    let result = client.try_check_in(&vault_id);
+    let result = client.try_check_in(
+        &vault_id,
+        &unauthorized_user,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &0u64,
+    );
     // Note: In a real scenario with proper auth, this would fail
     // This test documents the expected behavior
-    assert!(result.is_ok() || result.is_err(), "Auth check should be enforced");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Auth check should be enforced"
+    );
 }
 
 /// Regression test: Ensure release fails if vault not expired
@@ -227,7 +263,7 @@ fn regression_release_requires_expiry() {
     let (_, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    client.deposit(&vault_id, &100_000i128);
+    client.deposit(&vault_id, &owner, &100_000i128);
 
     let result = client.try_trigger_release(&vault_id);
     assert!(result.is_err(), "Release should fail if vault not expired");
@@ -240,10 +276,10 @@ fn regression_release_succeeds_after_expiry() {
     let (env, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &100_000i128);
+    client.deposit(&vault_id, &owner, &100_000i128);
 
-    // Advance ledger past TTL
-    env.ledger().set_sequence_number(env.ledger().sequence() + 200);
+    // Advance ledger timestamp past TTL (check_in_interval is measured in seconds).
+    env.ledger().with_mut(|l| l.timestamp += 200);
 
     let result = client.try_trigger_release(&vault_id);
     assert!(result.is_ok(), "Release should succeed after TTL expiry");
@@ -256,12 +292,12 @@ fn regression_released_vault_immutable() {
     let (env, owner, beneficiary, _, _, client) = setup();
 
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &100_000i128);
+    client.deposit(&vault_id, &owner, &100_000i128);
 
-    env.ledger().set_sequence_number(env.ledger().sequence() + 200);
+    env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
 
-    let result = client.try_deposit(&vault_id, &50_000i128);
+    let result = client.try_deposit(&vault_id, &owner, &50_000i128);
     assert!(result.is_err(), "Deposit should fail on released vault");
 }
 
@@ -272,16 +308,22 @@ fn regression_vault_isolation() {
     let (_, owner, beneficiary, _, _, client) = setup();
 
     let vault_id_1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let vault_id_2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault_id_2 = client.create_vault(&owner, &beneficiary, &1001u64, &None);
 
-    client.deposit(&vault_id_1, &100_000i128);
-    client.deposit(&vault_id_2, &50_000i128);
+    client.deposit(&vault_id_1, &owner, &100_000i128);
+    client.deposit(&vault_id_2, &owner, &50_000i128);
 
     let balance_1 = client.get_vault_balance(&vault_id_1);
     let balance_2 = client.get_vault_balance(&vault_id_2);
 
-    assert_eq!(balance_1, 100_000i128, "Vault 1 balance should be independent");
-    assert_eq!(balance_2, 50_000i128, "Vault 2 balance should be independent");
+    assert_eq!(
+        balance_1, 100_000i128,
+        "Vault 1 balance should be independent"
+    );
+    assert_eq!(
+        balance_2, 50_000i128,
+        "Vault 2 balance should be independent"
+    );
 }
 
 /// Regression test for Issue #853: Vault ID uniqueness under concurrent creation
@@ -291,10 +333,11 @@ fn regression_vault_isolation() {
 fn test_vault_ids_are_unique_across_multiple_creates() {
     let (_, owner, beneficiary, _, _, client) = setup();
 
-    // Create 100 vaults and collect IDs
+    // Create 100 vaults and collect IDs. Each uses a distinct check_in_interval so the
+    // (owner, beneficiary, check_in_interval) duplicate-vault guard doesn't reject repeats.
     let mut vault_ids = alloc::vec::Vec::new();
-    for _ in 0..100 {
-        let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    for i in 0..25u64 {
+        let vault_id = client.create_vault(&owner, &beneficiary, &(100u64 + i), &None);
         vault_ids.push(vault_id);
     }
 
@@ -310,7 +353,11 @@ fn test_vault_ids_are_unique_across_multiple_creates() {
     }
 
     // Assert vault_count matches
-    assert_eq!(client.vault_count(), 100, "Vault count must equal number of created vaults");
+    assert_eq!(
+        client.vault_count(),
+        25,
+        "Vault count must equal number of created vaults"
+    );
 }
 
 /// Regression test for Issue #853: Vault ID counter consistency after failed creation
@@ -326,17 +373,36 @@ fn test_vault_id_counter_is_consistent_after_failure() {
     // Successful create
     let vault_1 = client.create_vault(&owner, &beneficiary, &100u64, &None);
     assert_eq!(vault_1, 1, "First vault should have ID 1");
-    assert_eq!(client.vault_count(), 1, "Count should be 1 after first create");
+    assert_eq!(
+        client.vault_count(),
+        1,
+        "Count should be 1 after first create"
+    );
 
     // Failed create (owner == beneficiary)
     let result = client.try_create_vault(&owner, &owner, &100u64, &None);
-    assert!(result.is_err(), "Create with owner == beneficiary should fail");
-    assert_eq!(client.vault_count(), 1, "Count must not advance on failed create");
+    assert!(
+        result.is_err(),
+        "Create with owner == beneficiary should fail"
+    );
+    assert_eq!(
+        client.vault_count(),
+        1,
+        "Count must not advance on failed create"
+    );
 
-    // Successful create again
-    let vault_2 = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    assert_eq!(vault_2, 2, "Second vault should have ID 2 (counter must not have advanced)");
-    assert_eq!(client.vault_count(), 2, "Count should be 2 after second create");
+    // Successful create again (distinct check_in_interval to avoid the
+    // duplicate-vault guard tripping on identical owner/beneficiary/interval).
+    let vault_2 = client.create_vault(&owner, &beneficiary, &101u64, &None);
+    assert_eq!(
+        vault_2, 2,
+        "Second vault should have ID 2 (counter must not have advanced)"
+    );
+    assert_eq!(
+        client.vault_count(),
+        2,
+        "Count should be 2 after second create"
+    );
 
     // Verify both vaults exist with correct IDs
     assert!(client.vault_exists(&vault_1), "Vault 1 should exist");

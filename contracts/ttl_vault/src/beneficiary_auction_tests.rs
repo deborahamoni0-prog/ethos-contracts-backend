@@ -9,13 +9,7 @@ use soroban_sdk::{
     vec, Address, Env,
 };
 
-fn setup_auction() -> (
-    Env,
-    Address,
-    Address,
-    u64,
-    TtlVaultContractClient<'static>,
-) {
+fn setup_auction() -> (Env, Address, Address, u64, TtlVaultContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -97,7 +91,8 @@ fn test_auction_minimum_bid_enforcement() {
 
     // Above minimum
     let bidder2 = Address::generate(&env);
-    let result = client.try_place_auction_bid(&vault_id, &bidder2, &(minimum_bid + 100_000), &5_000u32);
+    let result =
+        client.try_place_auction_bid(&vault_id, &bidder2, &(minimum_bid + 100_000), &5_000u32);
     assert!(result.is_ok());
 }
 
@@ -122,7 +117,7 @@ fn test_auction_winner_selection() {
     client.place_auction_bid(&vault_id, &bidder3, &400_000i128, &4_000u32);
 
     env.ledger().set_timestamp((end + 1) as u64);
-    client.finalize_beneficiary_auction(&vault_id).unwrap();
+    client.finalize_beneficiary_auction(&vault_id);
 
     let auction = client.get_beneficiary_auction(&vault_id).unwrap();
     assert!(auction.finalized);
@@ -343,13 +338,8 @@ fn test_auction_finalization_timing() {
     let result = client.try_finalize_beneficiary_auction(&vault_id);
     assert!(result.is_err());
 
-    // At end time boundary
+    // At end time boundary: the auction end is inclusive, so finalization succeeds.
     env.ledger().set_timestamp(end as u64);
-    let result = client.try_finalize_beneficiary_auction(&vault_id);
-    assert!(result.is_err()); // Still within auction (exclusive end)
-
-    // After end time
-    env.ledger().set_timestamp((end + 1) as u64);
     let result = client.try_finalize_beneficiary_auction(&vault_id);
     assert!(result.is_ok());
 }

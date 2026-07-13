@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 // ── WebSocket authentication ────────────────────────────────────────────────
 
@@ -65,8 +65,6 @@ pub struct SetPreferencesRequest {
     pub hours_before_expiry: u32,
     pub frequency: Frequency,
 }
-
-
 
 /// Notification type sent to a device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,8 +166,6 @@ pub struct ChannelDeliveryLog {
     pub attempted_at: DateTime<Utc>,
     pub error: Option<String>,
 }
-
-
 
 /// A scheduled notification (pending delivery).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,7 +277,6 @@ pub struct PurchaseTtlInsuranceRequest {
 pub struct RecordOwnerActivityRequest {
     pub owner_id: u64,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultEvent {
@@ -600,7 +595,6 @@ pub struct SetSubscriptionRequest {
     pub frequency: SubscriptionFrequency,
 }
 
-
 // ── Idempotency Key support (#825) ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,3 +674,112 @@ pub struct SimulateReleaseResponse {
     pub simulated_at: DateTime<Utc>,
 }
 
+// ── Audit Log persistence (#961) ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub user_id: String,
+    pub action: String,
+    pub resource: String,
+    pub result: String,
+    pub ip_address: String,
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AuditLogQuery {
+    pub user_id: Option<String>,
+    pub action: Option<String>,
+    pub resource: Option<String>,
+    pub result: Option<String>,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+// ── Cache layer models ───────────────────────────────────────────────────────
+
+/// Lightweight read-projection of a Vault, cached separately from the full
+/// `Vault` struct to reduce allocation when only summary data is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSummary {
+    pub vault_id: String,
+    pub owner: String,
+    pub status: VaultStatus,
+    pub ttl_remaining: Option<u64>,
+    pub balance: i128,
+}
+
+impl From<&Vault> for VaultSummary {
+    fn from(v: &Vault) -> Self {
+        Self {
+            vault_id: v.id.clone(),
+            owner: v.owner.clone(),
+            status: v.status.clone(),
+            ttl_remaining: v.ttl_remaining,
+            balance: v.balance,
+        }
+    }
+}
+
+/// Response body returned by `POST /api/cache/invalidate/{vault_id}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheInvalidateResponse {
+    pub vault_id: String,
+    pub invalidated: bool,
+}
+
+// ── 2FA models (#965) ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwoFactorMethod {
+    Totp,
+    Sms,
+    Email,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoFactorConfig {
+    pub vault_id: String,
+    pub method: TwoFactorMethod,
+    pub enabled: bool,
+    pub secret: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Enable2FARequest {
+    pub method: TwoFactorMethod,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Verify2FARequest {
+    pub otp: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Enable2FAResponse {
+    pub vault_id: String,
+    pub method: TwoFactorMethod,
+    pub secret: Option<String>,
+    pub provisioning_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TwoFactorStatusResponse {
+    pub vault_id: String,
+    pub enabled: bool,
+    pub method: Option<TwoFactorMethod>,
+    pub verified: bool,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}

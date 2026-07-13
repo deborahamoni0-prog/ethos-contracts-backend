@@ -2,45 +2,49 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
+    extract::State,
     http::{HeaderValue, Method, Request, StatusCode},
     middleware,
     routing::{delete, get, post},
     Json, Router,
 };
+use chrono::TimeZone;
 use serde_json::json;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
-use crate::{
-    consensus::{ConflictStrategy, InMemoryBackend, NodeCache},
-    db::{Db, PoolConfig},
-    routes,
-    AppState,
+use ethos_protocol_backend::{
+    consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
+    db::{
+        create_audit_store, create_event_store, create_share_store, create_share_token_store,
+        create_vault_store, Db, PoolConfig,
+    },
+    routes, AppState,
 };
 
 fn test_state(db: Arc<Db>) -> AppState {
     db.migrate().unwrap();
-    let backend: Arc<InMemoryBackend> = Arc::new(InMemoryBackend::new());
+    let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
     let consensus = Arc::new(NodeCache::new(
         "test-node",
         backend,
         ConflictStrategy::LastWriteWins,
     ));
-    AppState { db, consensus }
-}
-
-fn test_app() -> Router {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
-    let state = Arc::new(AppState {
-        db: Arc::clone(&db),
+    AppState {
+        db,
         vault_store: create_vault_store(),
         event_store: create_event_store(),
         audit_store: create_audit_store(),
         share_store: create_share_store(),
         share_token_store: create_share_token_store(),
-    });
-    build_router(state)
+        consensus,
+    }
+}
+
+fn test_app() -> Router {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let state = test_state(db);
+    crate::build_router(state)
 }
 
 fn test_app_with_db(db: Arc<Db>) -> Router {
@@ -57,17 +61,13 @@ fn test_app_with_db(db: Arc<Db>) -> Router {
         )
         .route(
             "/api/vaults/:vault_id/subscriptions",
-            post(routes::set_subscription)
-                .delete(routes::delete_subscription),
+            post(routes::set_subscription).delete(routes::delete_subscription),
         )
         .route(
             "/api/vaults/:vault_id/reminders",
             get(routes::list_vault_reminders),
         )
-        .route(
-            "/notifications/unsubscribe",
-            get(routes::unsubscribe),
-        )
+        .route("/notifications/unsubscribe", get(routes::unsubscribe))
         .with_state(state)
 }
 
@@ -78,7 +78,9 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn ready_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn ready_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     match state.db.check_connectivity() {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
@@ -143,19 +145,25 @@ async fn test_set_and_get_preferences() {
     // Re-insert so we can GET from same db
     let db = Arc::new(Db::open(":memory:").unwrap());
     db.migrate().unwrap();
-    let prefs = crate::models::ReminderPreferences {
+    let prefs = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 1,
-        channels: vec![crate::models::Channel::Email],
+        channels: vec![ethos_protocol_backend::models::Channel::Email],
         hours_before_expiry: 24,
-        frequency: crate::models::Frequency::Once,
+        frequency: ethos_protocol_backend::models::Frequency::Once,
         deleted_at: None,
     };
     db.upsert(&prefs).unwrap();
     let fetched = db.get(1).unwrap();
     assert_eq!(fetched.vault_id, 1);
     assert_eq!(fetched.hours_before_expiry, 24);
-    assert_eq!(fetched.channels, vec![crate::models::Channel::Email]);
-    assert_eq!(fetched.frequency, crate::models::Frequency::Once);
+    assert_eq!(
+        fetched.channels,
+        vec![ethos_protocol_backend::models::Channel::Email]
+    );
+    assert_eq!(
+        fetched.frequency,
+        ethos_protocol_backend::models::Frequency::Once
+    );
     drop(app2);
 }
 
@@ -195,20 +203,23 @@ async fn test_upsert_overwrites() {
     let db = Arc::new(Db::open(":memory:").unwrap());
     db.migrate().unwrap();
 
-    let p1 = crate::models::ReminderPreferences {
+    let p1 = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 5,
-        channels: vec![crate::models::Channel::Email],
+        channels: vec![ethos_protocol_backend::models::Channel::Email],
         hours_before_expiry: 12,
-        frequency: crate::models::Frequency::Once,
+        frequency: ethos_protocol_backend::models::Frequency::Once,
         deleted_at: None,
     };
     db.upsert(&p1).unwrap();
 
-    let p2 = crate::models::ReminderPreferences {
+    let p2 = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 5,
-        channels: vec![crate::models::Channel::Sms, crate::models::Channel::Push],
+        channels: vec![
+            ethos_protocol_backend::models::Channel::Sms,
+            ethos_protocol_backend::models::Channel::Push,
+        ],
         hours_before_expiry: 6,
-        frequency: crate::models::Frequency::Hourly,
+        frequency: ethos_protocol_backend::models::Frequency::Hourly,
         deleted_at: None,
     };
     db.upsert(&p2).unwrap();
@@ -216,7 +227,10 @@ async fn test_upsert_overwrites() {
     let fetched = db.get(5).unwrap();
     assert_eq!(fetched.hours_before_expiry, 6);
     assert_eq!(fetched.channels.len(), 2);
-    assert_eq!(fetched.frequency, crate::models::Frequency::Hourly);
+    assert_eq!(
+        fetched.frequency,
+        ethos_protocol_backend::models::Frequency::Hourly
+    );
 }
 
 // ── #821: Health check endpoint tests ────────────────────────────────────────
@@ -226,7 +240,9 @@ async fn test_health_endpoint() {
     let app = test_app();
     let res = get_req(app, "/health").await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert!(json["version"].is_string());
@@ -237,7 +253,9 @@ async fn test_ready_endpoint() {
     let app = test_app();
     let res = get_req(app, "/ready").await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["database"], "connected");
@@ -250,7 +268,9 @@ async fn test_consensus_health_endpoint_consistent() {
     let app = test_app();
     let res = get_req(app, "/health/consensus").await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["cache_consistent"], true);
@@ -262,14 +282,14 @@ async fn test_consensus_health_endpoint_consistent() {
 #[tokio::test]
 async fn test_consensus_health_detects_and_resolves_divergence() {
     let db = Arc::new(Db::open(":memory:").unwrap());
-    let backend: Arc<InMemoryBackend> = Arc::new(InMemoryBackend::new());
+    let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
     let consensus = Arc::new(NodeCache::new(
         "test-node",
         Arc::clone(&backend),
         ConflictStrategy::LastWriteWins,
     ));
     consensus.put("vault:99", "authoritative").unwrap();
-    consensus.set_local_entry(crate::consensus::CacheEntry {
+    consensus.set_local_entry(ethos_protocol_backend::consensus::CacheEntry {
         key: "vault:99".to_string(),
         value: "stale".to_string(),
         node_id: "test-node".to_string(),
@@ -279,6 +299,11 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
 
     let state = AppState {
         db: Arc::clone(&db),
+        vault_store: create_vault_store(),
+        event_store: create_event_store(),
+        audit_store: create_audit_store(),
+        share_store: create_share_store(),
+        share_token_store: create_share_token_store(),
         consensus,
     };
     db.migrate().unwrap();
@@ -289,7 +314,9 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
 
     let res = get_req(app, "/health/consensus").await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "degraded");
     assert_eq!(json["cache_consistent"], false);
@@ -309,7 +336,11 @@ async fn test_pool_config_defaults() {
 
 #[tokio::test]
 async fn test_db_open_with_pool_config() {
-    let config = PoolConfig { min: 1, max: 5, timeout_secs: 15 };
+    let config = PoolConfig {
+        min: 1,
+        max: 5,
+        timeout_secs: 15,
+    };
     let db = Db::open_with_pool_config(":memory:", &config);
     assert!(db.is_ok());
 }
@@ -425,8 +456,17 @@ async fn test_subscription_endpoints() {
     let sub = db.get_subscription(42).unwrap().unwrap();
     assert_eq!(sub.vault_id, 42);
     assert_eq!(sub.owner, "owner_123");
-    assert_eq!(sub.channels, vec![crate::models::SubscriptionChannel::Email, crate::models::SubscriptionChannel::Sms]);
-    assert_eq!(sub.frequency, crate::models::SubscriptionFrequency::Weekly);
+    assert_eq!(
+        sub.channels,
+        vec![
+            ethos_protocol_backend::models::SubscriptionChannel::Email,
+            ethos_protocol_backend::models::SubscriptionChannel::Sms
+        ]
+    );
+    assert_eq!(
+        sub.frequency,
+        ethos_protocol_backend::models::SubscriptionFrequency::Weekly
+    );
 
     // 2. Try to POST with empty channels (should fail with UNPROCESSABLE_ENTITY)
     let bad_body = json!({
@@ -451,18 +491,17 @@ async fn test_subscription_endpoints() {
     assert!(deleted_sub.is_none());
 }
 
-
 // ── Issue #851: Mocked HTTP tests for notification delivery ─────────────────
 
 #[cfg(test)]
 mod notification_delivery_tests {
-    use std::sync::Arc;
-    use crate::notifications::{
+    use ethos_protocol_backend::models::{DeliveryStatus, NotificationType, RegisterTokenRequest};
+    use ethos_protocol_backend::notifications::{
+        create_delivery_store, create_prefs_store, create_schedule_store, create_token_store,
         FcmClient, NotificationService,
-        create_token_store, create_prefs_store, create_schedule_store, create_delivery_store,
     };
-    use crate::models::{RegisterTokenRequest, NotificationType, DeliveryStatus};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn make_service(fcm: Arc<FcmClient>) -> NotificationService {
         NotificationService::new(
@@ -488,7 +527,9 @@ mod notification_delivery_tests {
 
         let mut client = FcmClient::new("test-key".into(), "test-project".into());
         client.base_url = server.url();
-        let result = client.send("device-token-1", "Title", "Body", json!({})).await;
+        let result = client
+            .send("device-token-1", "Title", "Body", json!({}))
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "projects/test-project/messages/msg-001");
@@ -508,7 +549,9 @@ mod notification_delivery_tests {
 
         let mut client = FcmClient::new("bad-key".into(), "test-project".into());
         client.base_url = server.url();
-        let result = client.send("device-token-1", "Title", "Body", json!({})).await;
+        let result = client
+            .send("device-token-1", "Title", "Body", json!({}))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("FCM error 401"));
@@ -528,7 +571,9 @@ mod notification_delivery_tests {
 
         let mut client = FcmClient::new("test-key".into(), "test-project".into());
         client.base_url = server.url();
-        let result = client.send("device-token-1", "Title", "Body", json!({})).await;
+        let result = client
+            .send("device-token-1", "Title", "Body", json!({}))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("FCM error 429"));
@@ -544,7 +589,11 @@ mod notification_delivery_tests {
         let svc = make_service(Arc::new(fcm));
 
         // Schedule an immediate notification for owner with no registered tokens
-        svc.schedule_immediate("vault-1", "owner-no-token", NotificationType::CheckInReminder);
+        svc.schedule_immediate(
+            "vault-1",
+            "owner-no-token",
+            NotificationType::CheckInReminder,
+        );
 
         // No tokens → flush_pending records Failed
         svc.flush_pending().await;
@@ -554,7 +603,11 @@ mod notification_delivery_tests {
         assert_eq!(log[0].status, DeliveryStatus::Failed);
 
         // No HTTP call was made since no tokens exist
-        server.mock("POST", mockito::Matcher::Any).expect(0).create_async().await;
+        server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
     }
 
     /// Successful delivery: token registered, mock returns 200, status is Sent.
@@ -591,9 +644,6 @@ mod notification_delivery_tests {
 
 #[cfg(test)]
 mod simulator_tests {
-    use crate::db::{create_vault_store, Db};
-    use crate::handlers::{parse_scenario_types, simulate_release_handler, simulate_scenario};
-    use crate::models::{ScenarioType, Vault, VaultStatus};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -601,6 +651,11 @@ mod simulator_tests {
         Router,
     };
     use chrono::Utc;
+    use ethos_protocol_backend::db::{create_vault_store, Db};
+    use ethos_protocol_backend::handlers::{
+        parse_scenario_types, simulate_release_handler, simulate_scenario,
+    };
+    use ethos_protocol_backend::models::{ScenarioType, Vault, VaultStatus};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -682,7 +737,10 @@ mod simulator_tests {
         assert_eq!(result.confidence, "high");
 
         // projected_release_at should be approximately now + 1 day
-        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        let delta = result
+            .projected_release_at
+            .signed_duration_since(now)
+            .num_seconds();
         assert_eq!(delta, 86_400);
     }
 
@@ -693,7 +751,10 @@ mod simulator_tests {
 
         assert_eq!(result.seconds_until_release, 0);
         // projected_release_at should be ≈ now
-        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        let delta = result
+            .projected_release_at
+            .signed_duration_since(now)
+            .num_seconds();
         assert_eq!(delta, 0);
     }
 
@@ -702,15 +763,17 @@ mod simulator_tests {
     #[test]
     fn test_consistent_check_ins_never_releases() {
         let now = Utc::now();
-        let result =
-            simulate_scenario(now, ScenarioType::ConsistentCheckIns, 86_400, 86_400, 1);
+        let result = simulate_scenario(now, ScenarioType::ConsistentCheckIns, 86_400, 86_400, 1);
 
         assert_eq!(result.scenario, ScenarioType::ConsistentCheckIns);
         // -1 signals "never"
         assert_eq!(result.seconds_until_release, -1);
         assert_eq!(result.confidence, "high");
         // The far-future date should be well beyond current TTL
-        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        let delta = result
+            .projected_release_at
+            .signed_duration_since(now)
+            .num_seconds();
         assert!(delta > 86_400 * 365); // more than a year away
     }
 
@@ -757,13 +820,7 @@ mod simulator_tests {
     #[test]
     fn test_missed_three_check_ins_has_low_confidence() {
         let now = Utc::now();
-        let result = simulate_scenario(
-            now,
-            ScenarioType::MissedCheckInDates,
-            3600,
-            86_400,
-            3,
-        );
+        let result = simulate_scenario(now, ScenarioType::MissedCheckInDates, 3600, 86_400, 3);
         assert_eq!(result.confidence, "low");
     }
 
@@ -789,12 +846,8 @@ mod simulator_tests {
     #[test]
     fn test_simulate_release_handler_vault_not_found() {
         let store = create_vault_store();
-        let result = simulate_release_handler(
-            &store,
-            "nonexistent",
-            vec![ScenarioType::NoCheckIns],
-            1,
-        );
+        let result =
+            simulate_release_handler(&store, "nonexistent", vec![ScenarioType::NoCheckIns], 1);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("nonexistent"));
     }
@@ -825,8 +878,7 @@ mod simulator_tests {
         store.lock().unwrap().insert("vault-2".to_string(), vault);
 
         let result =
-            simulate_release_handler(&store, "vault-2", vec![ScenarioType::NoCheckIns], 1)
-                .unwrap();
+            simulate_release_handler(&store, "vault-2", vec![ScenarioType::NoCheckIns], 1).unwrap();
 
         let no_check_in_scenario = result
             .scenarios
@@ -843,13 +895,12 @@ mod simulator_tests {
         // When ttl_remaining is None, the handler computes TTL from last_check_in
         let store = create_vault_store();
         let mut vault = make_vault("vault-3", 3600, None); // 1 hour interval, no stored TTL
-        // last_check_in is Utc::now() so TTL should be close to 3600 seconds
+                                                           // last_check_in is Utc::now() so TTL should be close to 3600 seconds
         vault.ttl_remaining = None;
         store.lock().unwrap().insert("vault-3".to_string(), vault);
 
         let result =
-            simulate_release_handler(&store, "vault-3", vec![ScenarioType::NoCheckIns], 1)
-                .unwrap();
+            simulate_release_handler(&store, "vault-3", vec![ScenarioType::NoCheckIns], 1).unwrap();
 
         let no_check_in = result
             .scenarios
@@ -868,13 +919,9 @@ mod simulator_tests {
         let vault = make_vault("vault-4", 86_400, Some(43200));
         store.lock().unwrap().insert("vault-4".to_string(), vault);
 
-        let result = simulate_release_handler(
-            &store,
-            "vault-4",
-            vec![ScenarioType::MissedCheckInDates],
-            2,
-        )
-        .unwrap();
+        let result =
+            simulate_release_handler(&store, "vault-4", vec![ScenarioType::MissedCheckInDates], 2)
+                .unwrap();
 
         assert_eq!(result.scenarios.len(), 1);
         let s = &result.scenarios[0];
@@ -895,7 +942,7 @@ mod simulator_tests {
         Router::new()
             .route(
                 "/api/vaults/:vault_id/simulate-release",
-                get(crate::routes::simulate_release),
+                get(ethos_protocol_backend::routes::simulate_release),
             )
             .with_state(db)
     }
@@ -914,7 +961,9 @@ mod simulator_tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["vault_id"], "vault-http-1");
@@ -936,7 +985,9 @@ mod simulator_tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         let scenarios = json["scenarios"].as_array().unwrap();
@@ -990,7 +1041,9 @@ mod simulator_tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         let scenarios = json["scenarios"].as_array().unwrap();

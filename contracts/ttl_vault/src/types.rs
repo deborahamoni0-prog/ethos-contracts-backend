@@ -50,7 +50,7 @@ pub const SET_MAX_TTL_TOPIC: Symbol = symbol_short!("set_ttl");
 pub const SET_DECAY_RATE_TOPIC: Symbol = symbol_short!("set_dec");
 pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
 pub const TTL_DECAY_TOPIC: Symbol = symbol_short!("ttl_dec");
-pub const SET_BURN_PERCENTAGE_TOPIC: Symbol = symbol_short!("set_burn_pct");
+pub const SET_BURN_PERCENTAGE_TOPIC: Symbol = symbol_short!("set_brnp");
 pub const BURN_EVENT_TOPIC: Symbol = symbol_short!("burn_evt");
 pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
 pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
@@ -227,6 +227,15 @@ pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
 // Configurable countdown notifications
 pub const COUNTDOWN_NOTIF_TOPIC: Symbol = symbol_short!("cd_notif");
 pub const SET_COUNTDOWN_TOPIC: Symbol = symbol_short!("set_cd");
+
+// Beneficiary Anonymity (ZK)
+pub const BEN_COMMITTED_TOPIC: Symbol = symbol_short!("ben_com");
+pub const BEN_REVEALED_TOPIC: Symbol = symbol_short!("ben_rev");
+
+// Issue #965: two-factor authentication events
+pub const TWO_FACTOR_ENABLED_TOPIC: Symbol = symbol_short!("2fa_en");
+pub const TWO_FACTOR_DISABLED_TOPIC: Symbol = symbol_short!("2fa_dis");
+pub const TWO_FACTOR_VERIFIED_TOPIC: Symbol = symbol_short!("2fa_vrf");
 
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
@@ -458,6 +467,58 @@ pub enum DataKey {
     // Issue #965: two-factor authentication
     TwoFactorConfig(u64),
     TwoFactorVerified(u64),
+    // Issue #813: admin transfer timelock
+    AdminTransferProposedAt,
+    // Issue #814: pause reason tracking
+    PauseRecord,
+    // Beneficiary Anonymity (ZK)
+    BeneficiaryCommitment(u64),
+    RevealedBeneficiary(u64),
+    // Issue #503: beneficiary conditional acceptance with threshold
+    BeneficiaryConditionalAcceptance(u64),
+    // Issue #502: beneficiary conflict resolution
+    BeneficiaryConflict(u64),
+    // Beneficiary capacity limit
+    BeneficiaryVaultLimit,
+    // Issue #550: set of passkeys flagged as compromised
+    CompromisedPasskeys(u64),
+    // Countdown notification config
+    CountdownConfig(u64),
+    // Issue #561: passkey rotation enforcement
+    LastPasskeyRotation(u64, BytesN<32>),
+    // Issue #562: passkey compromise response
+    PasskeyLockout(u64),
+    // Issue #563: passkey recovery
+    PasskeyRecoveryRequest(u64),
+    RecoveryContacts(u64),
+    // Issue #561: passkey rotation enforcement
+    PasskeyRotationPolicy(u64),
+    // Issue #934: emergency vault recovery code (stores sha256 hash of the
+    // owner's off-chain recovery code)
+    RecoveryCodeHash(u64),
+    // Multi-release condition support
+    ReleaseConditions(u64),
+    // Issue #543: Vesting Acceleration on Death config
+    VestingAcceleration(u64),
+    // Issue #542: Vesting Forfeiture config
+    VestingForfeiture(u64),
+    // Issue #541: Vesting Rollover config
+    VestingRollover(u64),
+    // Issue #544: Vesting Stagger schedule
+    VestingStagger(u64),
+    // Issue #564: withdrawal approval workflow
+    WithdrawalApprovalRequest(u64),
+    WithdrawalApprovers(u64),
+    // Issue #576: withdrawal escrow
+    WithdrawalEscrow(u64),
+    // Issue #573: withdrawal proof
+    WithdrawalProof(u64, u64),
+    // Issue #575: withdrawal rate limiting
+    WithdrawalRateLimit(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #574: withdrawal rollback
+    WithdrawalRollback(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -662,8 +723,11 @@ pub struct YieldDistributionConfig {
 pub struct PasskeyHash {
     pub hash: BytesN<32>,
     pub added_at: u64,
-    /// Optional biometric credential hash bound to this passkey (SHA-256 commitment)
-    pub biometric_hash: Option<BytesN<32>>,
+    /// Optional biometric credential hash bound to this passkey (SHA-256 commitment).
+    /// Stored as variable-length `Bytes` rather than `BytesN<32>` — `Option<BytesN<N>>`
+    /// does not implement the `ScVal` conversion path that `#[contracttype]` derives
+    /// under `testutils` (see soroban-sdk 21.7.7).
+    pub biometric_hash: Option<Bytes>,
 }
 
 /// Backup code entry - Issue #393
@@ -898,7 +962,7 @@ pub struct BeneficiaryConflictClaim {
 
 /// Beneficiary conflict resolution - Issue #502
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum ConflictResolution {
     Pending,
     Approved(Address),
@@ -1415,3 +1479,144 @@ pub struct VaultSnapshot {
     pub content_hash: BytesN<32>,
 }
 
+/// Pause record stored when the contract is paused (Issue #814).
+#[contracttype]
+#[derive(Clone)]
+pub struct PauseRecord {
+    pub paused_by: Address,
+    pub reason: Bytes,
+    pub paused_at: u64,
+}
+
+/// Stored when an owner commits to an anonymous beneficiary.
+/// The actual beneficiary address is hidden until `reveal_beneficiary` is called.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryCommitment {
+    /// SHA-256 hash of the beneficiary address bytes (the commitment).
+    pub commitment: BytesN<32>,
+    pub committed_at: u64,
+}
+
+/// Encrypted backup codes for vault recovery (Issue #553).
+#[contracttype]
+#[derive(Clone)]
+pub struct EncryptedBackupCodes {
+    pub codes: Vec<Bytes>,
+}
+
+/// Passkey usage analytics.
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyAnalytics {
+    pub total_uses: u32,
+    pub unique_passkeys: u32,
+}
+
+/// Per-passkey usage statistics.
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyUsageStat {
+    pub passkey_hash: BytesN<32>,
+    pub use_count: u32,
+    pub first_used: u64,
+    pub last_used: u64,
+}
+
+/// Event topic for encrypted backup code operations.
+pub const BACKUP_CODES_ENCRYPTED_TOPIC: Symbol = symbol_short!("bk_enc");
+/// Event topic for passkey analytics.
+pub const PASSKEY_ANALYTICS_TOPIC: Symbol = symbol_short!("pk_anal");
+
+/// Issue #562: Passkey Compromise Response
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyLockout {
+    pub locked_at: u64,
+    pub unlock_at: u64,
+    pub failed_attempts: u32,
+}
+
+/// Issue #563: Passkey Recovery
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyRecoveryRequest {
+    pub new_passkey_hash: BytesN<32>,
+    pub initiated_at: u64,
+    pub recovery_code: String,
+    pub approved_contacts: Vec<Address>,
+    pub required_contacts: u32,
+}
+
+/// Issue #561: Passkey Rotation Enforcement
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyRotationPolicy {
+    pub rotation_period_days: u32,
+    pub enforce: bool,
+}
+
+/// Issue #564: Withdrawal Approval Workflow
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalApprovalRequest {
+    pub amount: i128,
+    pub requested_at: u64,
+    pub approvals: Vec<Address>,
+    pub required_approvals: u32,
+    pub expires_at: u64,
+}
+
+/// Issue #541: Vesting Rollover config.
+/// When enabled, unclaimed installments roll over and accumulate for the next claim.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingRolloverConfig {
+    /// Whether rollover is enabled for this vault's vesting schedule.
+    pub enabled: bool,
+    /// Accumulated rolled-over amount (in stroops) not yet claimed.
+    pub rolled_amount: i128,
+}
+
+/// Issue #542: Vesting Forfeiture config.
+/// When a beneficiary declines their role, unvested funds are forfeited to this address.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingForfeitureConfig {
+    /// Address that receives forfeited unvested funds.
+    pub forfeiture_recipient: Address,
+    /// Whether forfeiture has already been executed.
+    pub forfeited: bool,
+}
+
+/// Issue #543: Vesting Acceleration on Death config.
+/// When the owner is declared dead (via oracle), all remaining vesting installments
+/// are immediately released to the beneficiary.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingAccelerationConfig {
+    /// Oracle address authorized to declare owner death and trigger acceleration.
+    pub oracle: Address,
+    /// Whether acceleration has already been triggered.
+    pub accelerated: bool,
+}
+
+/// Issue #544: A single entry in a staggered vesting schedule.
+/// Each entry assigns a portion of the total vesting amount to a specific beneficiary
+/// with its own independent schedule parameters.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingStaggerEntry {
+    /// Beneficiary address for this stagger tranche.
+    pub beneficiary: Address,
+    /// Basis points of total_amount allocated to this beneficiary (all entries must sum to 10_000).
+    pub bps: u32,
+    /// Unix timestamp when this beneficiary's first installment becomes claimable.
+    pub start_time: u64,
+    /// Seconds between installments for this beneficiary.
+    pub interval: u64,
+    /// Total number of installments for this beneficiary.
+    pub num_installments: u32,
+    /// Number of installments already claimed by this beneficiary.
+    pub claimed_installments: u32,
+}

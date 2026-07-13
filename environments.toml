@@ -1,14 +1,25 @@
-# Network configuration
-STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+# Network configurations for Ethos-Protocol contract deployment.
+# Populated/updated automatically by scripts/deploy_testnet.sh and
+# scripts/deploy_mainnet.sh via scripts/deploy_utils.sh. `contract_ttl_vault`
+# must remain the first key under each section header - deploy_utils.sh
+# parses it positionally.
 
-# Contract addresses (after deployment)
-CONTRACT_TTL_VAULT=<your-contract-id>
+[testnet]
+contract_ttl_vault = "<your-contract-id>"
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
 
-# Frontend configuration
-VITE_STELLAR_NETWORK=testnet
-VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+[mainnet]
+contract_ttl_vault = "<your-contract-id>"
+rpc_url = "https://soroban-rpc.mainnet.stellar.org"
+network_passphrase = "Public Global Stellar Network ; September 2015"
 
-# Backend (reminder service)
-REMINDER_EMAIL_API_KEY=<your-key>
-REMINDER_SMS_API_KEY=<your-key>
+[futurenet]
+contract_ttl_vault = "<your-contract-id>"
+rpc_url = "https://rpc-futurenet.stellar.org"
+network_passphrase = "Test SDF Future Network ; October 2022"
+
+[standalone]
+contract_ttl_vault = "<your-contract-id>"
+rpc_url = "http://localhost:8000/soroban/rpc"
+network_passphrase = "Standalone Network ; February 2017"

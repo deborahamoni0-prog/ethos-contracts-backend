@@ -1,5 +1,5 @@
-use crate::models::*;
 use crate::db::*;
+use crate::models::*;
 use chrono::Utc;
 
 pub fn get_vault_templates() -> VaultTemplateList {
@@ -56,7 +56,10 @@ pub fn create_vault_from_template(
         ttl_remaining: Some(template.check_in_interval),
     };
 
-    store.lock().unwrap().insert(vault.id.clone(), vault.clone());
+    store
+        .lock()
+        .unwrap()
+        .insert(vault.id.clone(), vault.clone());
     Ok(vault)
 }
 
@@ -67,7 +70,10 @@ fn resolve_locale(locale: &Option<Locale>) -> &Locale {
     locale.as_ref().unwrap_or(&EN)
 }
 
-pub fn email_subject(notification_type: &NotificationType, locale: &Option<Locale>) -> &'static str {
+pub fn email_subject(
+    notification_type: &NotificationType,
+    locale: &Option<Locale>,
+) -> &'static str {
     match (resolve_locale(locale), notification_type) {
         // English
         (Locale::En, NotificationType::ExpiryWarning) => "Your vault is expiring soon",
@@ -104,45 +110,53 @@ pub fn email_body(
             let h = hours_remaining.unwrap_or(24);
             format!("Your vault {vault_id} expires in approximately {h} hours. Check in now to keep it active.")
         }
-        (Locale::En, NotificationType::CheckInReminder) =>
-            format!("Please check in to your vault {vault_id} to keep it active."),
-        (Locale::En, NotificationType::VaultReleased) =>
-            format!("Vault {vault_id} has been released to the designated beneficiary."),
-        (Locale::En, NotificationType::VaultPaused) =>
-            format!("Vault {vault_id} has been paused."),
+        (Locale::En, NotificationType::CheckInReminder) => {
+            format!("Please check in to your vault {vault_id} to keep it active.")
+        }
+        (Locale::En, NotificationType::VaultReleased) => {
+            format!("Vault {vault_id} has been released to the designated beneficiary.")
+        }
+        (Locale::En, NotificationType::VaultPaused) => format!("Vault {vault_id} has been paused."),
         // Spanish
         (Locale::Es, NotificationType::ExpiryWarning) => {
             let h = hours_remaining.unwrap_or(24);
             format!("Tu bóveda {vault_id} vence en aproximadamente {h} horas. Regístrate ahora para mantenerla activa.")
         }
-        (Locale::Es, NotificationType::CheckInReminder) =>
-            format!("Por favor regístrate en tu bóveda {vault_id} para mantenerla activa."),
-        (Locale::Es, NotificationType::VaultReleased) =>
-            format!("La bóveda {vault_id} ha sido liberada al beneficiario designado."),
-        (Locale::Es, NotificationType::VaultPaused) =>
-            format!("La bóveda {vault_id} ha sido pausada."),
+        (Locale::Es, NotificationType::CheckInReminder) => {
+            format!("Por favor regístrate en tu bóveda {vault_id} para mantenerla activa.")
+        }
+        (Locale::Es, NotificationType::VaultReleased) => {
+            format!("La bóveda {vault_id} ha sido liberada al beneficiario designado.")
+        }
+        (Locale::Es, NotificationType::VaultPaused) => {
+            format!("La bóveda {vault_id} ha sido pausada.")
+        }
         // French
         (Locale::Fr, NotificationType::ExpiryWarning) => {
             let h = hours_remaining.unwrap_or(24);
             format!("Votre coffre {vault_id} expire dans environ {h} heures. Enregistrez-vous maintenant.")
         }
-        (Locale::Fr, NotificationType::CheckInReminder) =>
-            format!("Veuillez vous enregistrer dans votre coffre {vault_id} pour le maintenir actif."),
-        (Locale::Fr, NotificationType::VaultReleased) =>
-            format!("Le coffre {vault_id} a été libéré au bénéficiaire désigné."),
-        (Locale::Fr, NotificationType::VaultPaused) =>
-            format!("Le coffre {vault_id} a été mis en pause."),
+        (Locale::Fr, NotificationType::CheckInReminder) => format!(
+            "Veuillez vous enregistrer dans votre coffre {vault_id} pour le maintenir actif."
+        ),
+        (Locale::Fr, NotificationType::VaultReleased) => {
+            format!("Le coffre {vault_id} a été libéré au bénéficiaire désigné.")
+        }
+        (Locale::Fr, NotificationType::VaultPaused) => {
+            format!("Le coffre {vault_id} a été mis en pause.")
+        }
         // German
         (Locale::De, NotificationType::ExpiryWarning) => {
             let h = hours_remaining.unwrap_or(24);
             format!("Ihr Tresor {vault_id} läuft in etwa {h} Stunden ab. Melden Sie sich jetzt an.")
         }
-        (Locale::De, NotificationType::CheckInReminder) =>
-            format!("Bitte melden Sie sich bei Ihrem Tresor {vault_id} an, um ihn aktiv zu halten."),
-        (Locale::De, NotificationType::VaultReleased) =>
-            format!("Tresor {vault_id} wurde an den designierten Begünstigten freigegeben."),
-        (Locale::De, NotificationType::VaultPaused) =>
-            format!("Tresor {vault_id} wurde pausiert."),
+        (Locale::De, NotificationType::CheckInReminder) => {
+            format!("Bitte melden Sie sich bei Ihrem Tresor {vault_id} an, um ihn aktiv zu halten.")
+        }
+        (Locale::De, NotificationType::VaultReleased) => {
+            format!("Tresor {vault_id} wurde an den designierten Begünstigten freigegeben.")
+        }
+        (Locale::De, NotificationType::VaultPaused) => format!("Tresor {vault_id} wurde pausiert."),
     }
 }
 
@@ -154,9 +168,15 @@ mod tests {
     fn test_get_vault_templates() {
         let templates = get_vault_templates();
         assert_eq!(templates.templates.len(), 3);
-        assert!(templates.templates.iter().any(|t| t.id == "simple-inheritance"));
+        assert!(templates
+            .templates
+            .iter()
+            .any(|t| t.id == "simple-inheritance"));
         assert!(templates.templates.iter().any(|t| t.id == "family-trust"));
-        assert!(templates.templates.iter().any(|t| t.id == "business-succession"));
+        assert!(templates
+            .templates
+            .iter()
+            .any(|t| t.id == "business-succession"));
     }
 
     #[test]
@@ -315,13 +335,23 @@ mod tests {
 
     #[test]
     fn test_expiry_body_includes_hours() {
-        let body = email_body(&NotificationType::ExpiryWarning, &Some(Locale::En), "v1", Some(6));
+        let body = email_body(
+            &NotificationType::ExpiryWarning,
+            &Some(Locale::En),
+            "v1",
+            Some(6),
+        );
         assert!(body.contains("6"));
     }
 
     #[test]
     fn test_expiry_body_defaults_to_24_hours() {
-        let body = email_body(&NotificationType::ExpiryWarning, &Some(Locale::En), "v1", None);
+        let body = email_body(
+            &NotificationType::ExpiryWarning,
+            &Some(Locale::En),
+            "v1",
+            None,
+        );
         assert!(body.contains("24"));
     }
 }

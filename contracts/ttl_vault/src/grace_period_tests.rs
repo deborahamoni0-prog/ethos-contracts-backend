@@ -70,7 +70,7 @@ fn test_grace_period_active_blocks_release() {
     // It is expired now, but grace period is 100 seconds
     // So attempting to trigger release should fail with GracePeriodActive
     let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(83)); // GracePeriodActive
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::GracePeriodActive as u32));
 
     // Fast forward past the grace period
     now += 100;

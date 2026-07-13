@@ -1,17 +1,22 @@
 # Cargo Audit Configuration
-# This file configures vulnerability severity thresholds and allows accepted advisories.
-# The CI will fail on any CRITICAL or HIGH severity vulnerabilities.
-
-# Vulnerabilities to deny (CI will fail)
-deny = ["unmaintained", "unsound"]
-
-# Vulnerabilities to warn on (CI will pass but warn)
-warn = []
+# This file configures accepted advisories. Severity/deny behavior (unmaintained,
+# unsound, yanked, warnings) is controlled by the `cargo audit --deny warnings`
+# CLI flag in ci.yml, not by TOML keys here - cargo-audit's config schema only
+# supports [advisories], [database], [output], [target], and [yanked] sections.
 
 # Accepted vulnerability advisories
 # Format: advisory IDs that have been reviewed and accepted due to legitimate reasons
 # Include justification for each acceptance
 [advisories]
-
-# Example (if any critical vulnerability needs to be accepted):
-# "RUSTSEC-2021-0001" = { reason = "This affects only feature X which is not used" }
+ignore = [
+    # `paste` (unmaintained) is pulled in transitively by soroban-wasmi, part of
+    # the pinned Soroban SDK's WASM interpreter. No newer version exists and it
+    # cannot be removed without a Soroban SDK upgrade.
+    "RUSTSEC-2024-0436",
+    # `rand` 0.8.5 (unsound only when combined with a custom logger calling
+    # rand::rng(), which this codebase does not do) is pinned transitively by
+    # soroban-env-host/soroban-sdk and tokio-tungstenite; multiple rand versions
+    # already coexist in the tree and 0.8.5 cannot be removed without an SDK
+    # upgrade.
+    "RUSTSEC-2026-0097",
+]

@@ -9,13 +9,7 @@ use soroban_sdk::{
     vec, Address, Env,
 };
 
-fn setup_vesting() -> (
-    Env,
-    Address,
-    Address,
-    u64,
-    TtlVaultContractClient<'static>,
-) {
+fn setup_vesting() -> (Env, Address, Address, u64, TtlVaultContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -54,21 +48,14 @@ fn test_vesting_with_multiple_beneficiaries_different_schedules() {
     let start = env.ledger().timestamp() + 100;
 
     // Different vesting schedules for different beneficiaries
-    let result_a = client.try_set_beneficiary_vesting(
-        &vault_id,
-        &owner,
-        &ben_a,
-        &start,
-        &86_400u64,
-        &4u32,
-        &0u64,
-    );
+    let result_a = client
+        .try_set_beneficiary_vesting(&vault_id, &owner, &ben_a, &start, &86_400u64, &4u32, &0u64);
     let result_b = client.try_set_beneficiary_vesting(
         &vault_id,
         &owner,
         &ben_b,
         &(start + 172_800u64), // 2 days later
-        &172_800u64,            // 2-day interval
+        &172_800u64,           // 2-day interval
         &2u32,
         &0u64,
     );
@@ -92,15 +79,35 @@ fn test_vesting_schedule_can_be_updated() {
     let start = env.ledger().timestamp() + 100;
 
     // Set initial schedule
-    client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &86_400u64, &4u32, &0u64);
+    client.set_beneficiary_vesting(
+        &vault_id,
+        &owner,
+        &beneficiary,
+        &start,
+        &86_400u64,
+        &4u32,
+        &0u64,
+    );
 
-    let initial = client.get_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    let initial = client
+        .get_beneficiary_vesting(&vault_id, &beneficiary)
+        .unwrap();
     assert_eq!(initial.num_installments, 4u32);
 
     // Update to new schedule
-    client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &86_400u64, &6u32, &0u64);
+    client.set_beneficiary_vesting(
+        &vault_id,
+        &owner,
+        &beneficiary,
+        &start,
+        &86_400u64,
+        &6u32,
+        &0u64,
+    );
 
-    let updated = client.get_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    let updated = client
+        .get_beneficiary_vesting(&vault_id, &beneficiary)
+        .unwrap();
     assert_eq!(updated.num_installments, 6u32);
     assert_eq!(updated.claimed_installments, 0u32); // Reset on update
 }
@@ -114,7 +121,15 @@ fn test_vesting_cliff_prevents_early_claim() {
 
     let cliff = 31_536_000u64; // 1 year
 
-    client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &86_400u64, &4u32, &cliff);
+    client.set_beneficiary_vesting(
+        &vault_id,
+        &owner,
+        &beneficiary,
+        &start,
+        &86_400u64,
+        &4u32,
+        &cliff,
+    );
 
     client.trigger_release(&vault_id);
 
@@ -134,8 +149,10 @@ fn test_vesting_with_uneven_amounts() {
     let (env, owner, beneficiary, vault_id, client) = setup_vesting();
 
     // 1,000,001 stroops / 3 installments = 333,333 + 333,333 + 333_335
+    // setup_vesting() already deposited 4_000_000; withdraw the excess so the
+    // vault balance (which becomes the vesting total) is exactly `amount`.
     let amount = 1_000_001i128;
-    client.deposit(&vault_id, &owner, &(amount - 4_000_000));
+    client.withdraw(&vault_id, &owner, &(4_000_000 - amount));
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
@@ -144,17 +161,17 @@ fn test_vesting_with_uneven_amounts() {
 
     client.trigger_release(&vault_id);
 
-    // First claim
+    // First claim (elapsed=0 -> installment 1 of 3)
+    env.ledger().set_timestamp(start);
+    let amount_1 = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
+
+    // Second claim (elapsed=1 -> installment 2 of 3)
+    env.ledger().set_timestamp(start + 1);
+    let amount_2 = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
+
+    // Last installment should include remainder (elapsed=2 -> installment 3 of 3)
     env.ledger().set_timestamp(start + 2);
-    let amount_1 = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
-
-    // Last installment should include remainder
-    env.ledger().set_timestamp(start + 4);
-    let amount_2 = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
-
-    // Last installment (claimed_installments = 3)
-    env.ledger().set_timestamp(start + 6);
-    let amount_3 = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    let amount_3 = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
 
     let total = amount_1 + amount_2 + amount_3;
     assert_eq!(total, amount);
@@ -165,7 +182,15 @@ fn test_vesting_requires_vault_released() {
     let (env, owner, beneficiary, vault_id, client) = setup_vesting();
 
     let start = env.ledger().timestamp() + 100;
-    client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &86_400u64, &4u32, &0u64);
+    client.set_beneficiary_vesting(
+        &vault_id,
+        &owner,
+        &beneficiary,
+        &start,
+        &86_400u64,
+        &4u32,
+        &0u64,
+    );
 
     // Try to claim before vault is released
     env.ledger().set_timestamp(start + 86_400 + 10);
@@ -179,6 +204,8 @@ fn test_vesting_nonexistent_schedule() {
     let (env, _, _, vault_id, client) = setup_vesting();
 
     let nonexistent = Address::generate(&env);
+    // Advance past check_in_interval (100s) so the vault is expired and eligible for release.
+    env.ledger().with_mut(|l| l.timestamp += 100);
     client.trigger_release(&vault_id);
 
     let result = client.try_claim_beneficiary_vesting(&vault_id, &nonexistent);
@@ -198,18 +225,20 @@ fn test_vesting_claim_sequence() {
     // Per installment = 4_000_000 / 4 = 1_000_000
     let per_install = 1_000_000i128;
 
-    // Claim 1: at timestamp start + 1
-    env.ledger().set_timestamp(start + 1);
-    let claim_1 = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    // Claim 1: exactly at start (elapsed=0 -> 1 installment available)
+    env.ledger().set_timestamp(start);
+    let claim_1 = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
     assert_eq!(claim_1, per_install);
 
-    // Claim 2: at timestamp start + 2
-    env.ledger().set_timestamp(start + 2);
-    let claim_2 = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    // Claim 2: one interval later (elapsed=1 -> 1 more installment available)
+    env.ledger().set_timestamp(start + 1);
+    let claim_2 = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
     assert_eq!(claim_2, per_install);
 
     // Verify claimed_installments advanced
-    let schedule = client.get_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    let schedule = client
+        .get_beneficiary_vesting(&vault_id, &beneficiary)
+        .unwrap();
     assert_eq!(schedule.claimed_installments, 2u32);
 }
 
@@ -223,16 +252,16 @@ fn test_vesting_all_claimed_blocks_further_claims() {
     client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &1u64, &2u32, &0u64);
     client.trigger_release(&vault_id);
 
-    // Claim first installment
+    // Claim first installment (elapsed=0 -> 1 of 2 installments available)
+    env.ledger().set_timestamp(start);
+    let _ = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
+
+    // Claim second (final) installment (elapsed=1 -> both installments available)
     env.ledger().set_timestamp(start + 1);
     let _ = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
 
-    // Claim second (final) installment
-    env.ledger().set_timestamp(start + 2);
-    let _ = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
-
     // Try to claim again - should fail
-    env.ledger().set_timestamp(start + 3);
+    env.ledger().set_timestamp(start + 2);
     let result = client.try_claim_beneficiary_vesting(&vault_id, &beneficiary);
     assert!(result.is_err());
 }
@@ -241,20 +270,30 @@ fn test_vesting_all_claimed_blocks_further_claims() {
 fn test_vesting_large_amounts() {
     let (env, owner, beneficiary, vault_id, client) = setup_vesting();
 
-    // Deposit a large amount
-    let large_amount = 1_000_000_000_000i128; // 10M XLM
+    // Deposit a large amount (setup_vesting only mints 1_000_000_000 stroops to the
+    // owner, and has already deposited 4_000_000 of it, so cap this below that).
+    let large_amount = 500_000_000i128;
     client.deposit(&vault_id, &owner, &(large_amount - 4_000_000));
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
 
-    client.set_beneficiary_vesting(&vault_id, &owner, &beneficiary, &start, &86_400u64, &100u32, &0u64);
+    client.set_beneficiary_vesting(
+        &vault_id,
+        &owner,
+        &beneficiary,
+        &start,
+        &86_400u64,
+        &100u32,
+        &0u64,
+    );
     client.trigger_release(&vault_id);
 
     let per_install = large_amount / 100;
 
-    env.ledger().set_timestamp(start + 86_400);
-    let claimed = client.claim_beneficiary_vesting(&vault_id, &beneficiary).unwrap();
+    // Claim exactly at start (elapsed=0 -> 1 of 100 installments available).
+    env.ledger().set_timestamp(start);
+    let claimed = client.claim_beneficiary_vesting(&vault_id, &beneficiary);
 
     assert_eq!(claimed, per_install);
 }

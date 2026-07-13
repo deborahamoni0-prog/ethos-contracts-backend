@@ -21,6 +21,8 @@ unused_self = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
+cast_lossless = "allow"
+unnecessary_cast = "allow"
 
 # Documentation style; enforced selectively as the codebase matures
 missing_errors_doc = "allow"
@@ -29,7 +31,7 @@ doc_markdown = "allow"
 
 # Large domain models and error enums
 enum_variant_names = "allow"
-struct_field_names_as_self_description = "allow"
+struct_field_names = "allow"
 struct_excessive_bools = "allow"
 fn_params_excessive_bools = "allow"
 similar_names = "allow"

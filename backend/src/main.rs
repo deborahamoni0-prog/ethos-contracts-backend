@@ -1,43 +1,26 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
-    extract::{FromRef, State},
+    extract::State,
     http::{HeaderValue, Method, StatusCode},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
-mod consensus;
-mod db;
-mod error;
-mod handlers;
-mod models;
-mod notifications;
-mod routes;
-mod scheduler;
-mod two_factor;
+use ethos_protocol_backend::{
+    consensus::NodeCache,
+    contract_version_check::{check_contract_version, parse_min_contract_version},
+    db::{
+        create_audit_store, create_event_store, create_share_store, create_share_token_store,
+        create_vault_store, AppState, Db, PoolConfig,
+    },
+    routes, scheduler,
+};
 
 #[cfg(test)]
 mod tests;
-
-pub use consensus::NodeCache;
-pub use db::Db;
-pub use db::AppState;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Arc<Db>,
-    pub consensus: Arc<NodeCache>,
-}
-
-impl FromRef<AppState> for Arc<Db> {
-    fn from_ref(state: &AppState) -> Arc<Db> {
-        Arc::clone(&state.db)
-    }
-}
 
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
@@ -102,6 +85,33 @@ async fn consensus_health_handler(
     }
 }
 
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/health/consensus", get(consensus_health_handler))
+        .route("/ready", get(ready_handler))
+        .route(
+            "/api/vaults/:vault_id/reminder-preferences",
+            post(routes::set_preferences)
+                .get(routes::get_preferences)
+                .delete(routes::delete_preferences),
+        )
+        .route(
+            "/api/vaults/:vault_id/subscriptions",
+            post(routes::set_subscription).delete(routes::delete_subscription),
+        )
+        .route(
+            "/api/vaults/:vault_id/reminders",
+            get(routes::list_vault_reminders),
+        )
+        .route(
+            "/api/vaults/:vault_id/simulate-release",
+            get(routes::simulate_release),
+        )
+        .layer(build_cors_layer())
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -109,7 +119,8 @@ async fn main() {
         .init();
 
     // Check contract version before proceeding with server startup
-    let min_contract_version = parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());
+    let min_contract_version =
+        parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());
 
     let version_result = check_contract_version(
         || async {
@@ -133,7 +144,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let pool_config = db::PoolConfig::from_env();
+    let pool_config = PoolConfig::from_env();
     tracing::info!(
         min = pool_config.min,
         max = pool_config.max,
@@ -141,7 +152,8 @@ async fn main() {
         "database pool configuration"
     );
 
-    let db = Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+    let db =
+        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
     let consensus = NodeCache::from_env();
@@ -158,34 +170,15 @@ async fn main() {
 
     let state = AppState {
         db,
+        vault_store: create_vault_store(),
+        event_store: create_event_store(),
+        audit_store: create_audit_store(),
+        share_store: create_share_store(),
+        share_token_store: create_share_token_store(),
         consensus,
     };
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/health/consensus", get(consensus_health_handler))
-        .route("/ready", get(ready_handler))
-        .route(
-            "/api/vaults/:vault_id/reminder-preferences",
-            post(routes::set_preferences)
-                .get(routes::get_preferences)
-                .delete(routes::delete_preferences),
-        )
-        .route(
-            "/api/vaults/:vault_id/subscriptions",
-            post(routes::set_subscription)
-                .delete(routes::delete_subscription),
-        )
-        .route(
-            "/api/vaults/:vault_id/reminders",
-            get(routes::list_vault_reminders),
-        )
-        .route(
-            "/api/vaults/:vault_id/simulate-release",
-            get(routes::simulate_release),
-        )
-        .layer(build_cors_layer())
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

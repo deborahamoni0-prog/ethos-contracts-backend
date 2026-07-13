@@ -4,6 +4,8 @@ target/
 **/__snapshots__/
 *.snap
 *.snap.new
+test_snapshots/
+*.proptest-regressions
 
 # Build artifacts
 *.wasm
