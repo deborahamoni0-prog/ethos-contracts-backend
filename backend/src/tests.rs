@@ -21,8 +21,28 @@ use ethos_protocol_backend::{
     routes, AppState,
 };
 
-fn test_state(db: Arc<Db>) -> AppState {
-    db.migrate().unwrap();
+/// Base Postgres connection string used by the test suite. Points at the
+/// `db` service provisioned by docker-compose.yml / CI by default; override
+/// with `TEST_DATABASE_URL` (or `DATABASE_URL`) to point at a different
+/// instance. Each call to `Db::open_isolated` below creates a fresh,
+/// uniquely-named schema on this server so tests don't collide with each
+/// other despite sharing one physical database.
+fn test_database_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| {
+            "postgres://ethos_user:ethos_password@localhost:5432/ethos_protocol".to_string()
+        })
+}
+
+async fn open_test_db() -> Db {
+    Db::open_isolated(&test_database_url())
+        .await
+        .expect("failed to open isolated test database schema; is Postgres running? (see TEST_DATABASE_URL)")
+}
+
+async fn test_state(db: Arc<Db>) -> AppState {
+    db.migrate().await.unwrap();
     let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
     let consensus = Arc::new(NodeCache::new(
         "test-node",
@@ -40,14 +60,14 @@ fn test_state(db: Arc<Db>) -> AppState {
     }
 }
 
-fn test_app() -> Router {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    let state = test_state(db);
+async fn test_app() -> Router {
+    let db = Arc::new(open_test_db().await);
+    let state = test_state(db).await;
     crate::build_router(state)
 }
 
-fn test_app_with_db(db: Arc<Db>) -> Router {
-    let state = test_state(db);
+async fn test_app_with_db(db: Arc<Db>) -> Router {
+    let state = test_state(db).await;
     Router::new()
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
@@ -80,7 +100,7 @@ async fn health_handler() -> Json<serde_json::Value> {
 async fn ready_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
+    match state.db.check_connectivity().await {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
@@ -131,7 +151,7 @@ async fn get_req(app: Router, uri: &str) -> axum::response::Response {
 
 #[tokio::test]
 async fn test_set_and_get_preferences() {
-    let app = test_app();
+    let app = test_app().await;
     let body = json!({
         "channels": ["email", "sms"],
         "hours_before_expiry": 48,
@@ -140,10 +160,10 @@ async fn test_set_and_get_preferences() {
     let res = post_json(app, "/api/vaults/1/reminder-preferences", body).await;
     assert_eq!(res.status(), StatusCode::OK);
 
-    let app2 = test_app();
+    let app2 = test_app().await;
     // Re-insert so we can GET from same db
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
+    let db = Arc::new(open_test_db().await);
+    db.migrate().await.unwrap();
     let prefs = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 1,
         channels: vec![ethos_protocol_backend::models::Channel::Email],
@@ -151,8 +171,8 @@ async fn test_set_and_get_preferences() {
         frequency: ethos_protocol_backend::models::Frequency::Once,
         deleted_at: None,
     };
-    db.upsert(&prefs).unwrap();
-    let fetched = db.get(1).unwrap();
+    db.upsert(&prefs).await.unwrap();
+    let fetched = db.get(1).await.unwrap();
     assert_eq!(fetched.vault_id, 1);
     assert_eq!(fetched.hours_before_expiry, 24);
     assert_eq!(
@@ -168,14 +188,14 @@ async fn test_set_and_get_preferences() {
 
 #[tokio::test]
 async fn test_get_not_found() {
-    let app = test_app();
+    let app = test_app().await;
     let res = get_req(app, "/api/vaults/999/reminder-preferences").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn test_set_empty_channels_rejected() {
-    let app = test_app();
+    let app = test_app().await;
     let body = json!({
         "channels": [],
         "hours_before_expiry": 24,
@@ -187,7 +207,7 @@ async fn test_set_empty_channels_rejected() {
 
 #[tokio::test]
 async fn test_set_zero_hours_rejected() {
-    let app = test_app();
+    let app = test_app().await;
     let body = json!({
         "channels": ["push"],
         "hours_before_expiry": 0,
@@ -199,8 +219,8 @@ async fn test_set_zero_hours_rejected() {
 
 #[tokio::test]
 async fn test_upsert_overwrites() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
+    let db = Arc::new(open_test_db().await);
+    db.migrate().await.unwrap();
 
     let p1 = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 5,
@@ -209,7 +229,7 @@ async fn test_upsert_overwrites() {
         frequency: ethos_protocol_backend::models::Frequency::Once,
         deleted_at: None,
     };
-    db.upsert(&p1).unwrap();
+    db.upsert(&p1).await.unwrap();
 
     let p2 = ethos_protocol_backend::models::ReminderPreferences {
         vault_id: 5,
@@ -221,9 +241,9 @@ async fn test_upsert_overwrites() {
         frequency: ethos_protocol_backend::models::Frequency::Hourly,
         deleted_at: None,
     };
-    db.upsert(&p2).unwrap();
+    db.upsert(&p2).await.unwrap();
 
-    let fetched = db.get(5).unwrap();
+    let fetched = db.get(5).await.unwrap();
     assert_eq!(fetched.hours_before_expiry, 6);
     assert_eq!(fetched.channels.len(), 2);
     assert_eq!(
@@ -236,7 +256,7 @@ async fn test_upsert_overwrites() {
 
 #[tokio::test]
 async fn test_health_endpoint() {
-    let app = test_app();
+    let app = test_app().await;
     let res = get_req(app, "/health").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -249,7 +269,7 @@ async fn test_health_endpoint() {
 
 #[tokio::test]
 async fn test_ready_endpoint() {
-    let app = test_app();
+    let app = test_app().await;
     let res = get_req(app, "/ready").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -264,7 +284,7 @@ async fn test_ready_endpoint() {
 
 #[tokio::test]
 async fn test_consensus_health_endpoint_consistent() {
-    let app = test_app();
+    let app = test_app().await;
     let res = get_req(app, "/health/consensus").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -280,7 +300,7 @@ async fn test_consensus_health_endpoint_consistent() {
 
 #[tokio::test]
 async fn test_consensus_health_detects_and_resolves_divergence() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
+    let db = Arc::new(open_test_db().await);
     let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
     let consensus = Arc::new(NodeCache::new(
         "test-node",
@@ -305,7 +325,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         share_token_store: create_share_token_store(),
         consensus,
     };
-    db.migrate().unwrap();
+    db.migrate().await.unwrap();
 
     let app = Router::new()
         .route("/health/consensus", get(consensus_health_handler))
@@ -340,7 +360,7 @@ async fn test_db_open_with_pool_config() {
         max: 5,
         timeout_secs: 15,
     };
-    let db = Db::open_with_pool_config(":memory:", &config);
+    let db = Db::open_with_pool_config(&test_database_url(), &config).await;
     assert!(db.is_ok());
 }
 
@@ -348,7 +368,7 @@ async fn test_db_open_with_pool_config() {
 
 #[tokio::test]
 async fn test_cors_allowed_origin() {
-    let state = test_state(Arc::new(Db::open(":memory:").unwrap()));
+    let state = test_state(Arc::new(open_test_db().await)).await;
 
     let cors = CorsLayer::new()
         .allow_origin("http://example.com".parse::<HeaderValue>().unwrap())
@@ -381,7 +401,7 @@ async fn test_cors_allowed_origin() {
 
 #[tokio::test]
 async fn test_cors_rejected_origin() {
-    let state = test_state(Arc::new(Db::open(":memory:").unwrap()));
+    let state = test_state(Arc::new(open_test_db().await)).await;
 
     let cors = CorsLayer::new()
         .allow_origin("http://allowed.com".parse::<HeaderValue>().unwrap())
@@ -416,31 +436,31 @@ async fn test_cors_rejected_origin() {
 
 #[tokio::test]
 async fn test_scheduler_handles_db_errors_gracefully() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
+    let db = Arc::new(open_test_db().await);
     // Intentionally do NOT run migrate() so tables don't exist.
     // The scheduler should log errors and continue, not panic.
-    let result = db.all();
+    let result = db.all().await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_scheduler_insurance_handles_db_errors() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
+    let db = Arc::new(open_test_db().await);
     // No migration — all_enabled_insurance_policies will fail.
-    let result = db.all_enabled_insurance_policies();
+    let result = db.all_enabled_insurance_policies().await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_db_check_connectivity() {
-    let db = Db::open(":memory:").unwrap();
-    assert!(db.check_connectivity().is_ok());
+    let db = open_test_db().await;
+    assert!(db.check_connectivity().await.is_ok());
 }
 
 #[tokio::test]
 async fn test_subscription_endpoints() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    let app = test_app_with_db(Arc::clone(&db));
+    let db = Arc::new(open_test_db().await);
+    let app = test_app_with_db(Arc::clone(&db)).await;
 
     // 1. Create a subscription via POST
     let body = json!({
@@ -452,7 +472,7 @@ async fn test_subscription_endpoints() {
     assert_eq!(res.status(), StatusCode::OK);
 
     // Verify it was saved in the DB
-    let sub = db.get_subscription(42).unwrap().unwrap();
+    let sub = db.get_subscription(42).await.unwrap().unwrap();
     assert_eq!(sub.vault_id, 42);
     assert_eq!(sub.owner, "owner_123");
     assert_eq!(
@@ -486,7 +506,7 @@ async fn test_subscription_endpoints() {
     assert_eq!(res_delete.status(), StatusCode::NO_CONTENT);
 
     // Verify it was removed from the DB
-    let deleted_sub = db.get_subscription(42).unwrap();
+    let deleted_sub = db.get_subscription(42).await.unwrap();
     assert!(deleted_sub.is_none());
 }
 
@@ -649,8 +669,9 @@ mod simulator_tests {
         routing::get,
         Router,
     };
+    use super::open_test_db;
     use chrono::Utc;
-    use ethos_protocol_backend::db::{create_vault_store, Db};
+    use ethos_protocol_backend::db::create_vault_store;
     use ethos_protocol_backend::handlers::{
         parse_scenario_types, simulate_release_handler, simulate_scenario,
     };
@@ -931,9 +952,9 @@ mod simulator_tests {
 
     // ── HTTP endpoint test ────────────────────────────────────────────────────
 
-    fn simulator_app() -> Router {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
+    async fn simulator_app() -> Router {
+        let db = Arc::new(open_test_db().await);
+        db.migrate().await.unwrap();
 
         // Pre-populate the in-memory vault store
         db.insert_vault(make_vault("vault-http-1", 86_400, Some(3600)));
@@ -948,7 +969,7 @@ mod simulator_tests {
 
     #[tokio::test]
     async fn test_simulate_release_http_200() {
-        let app = simulator_app();
+        let app = simulator_app().await;
         let res = app
             .oneshot(
                 Request::builder()
@@ -972,7 +993,7 @@ mod simulator_tests {
 
     #[tokio::test]
     async fn test_simulate_release_http_with_scenario_filter() {
-        let app = simulator_app();
+        let app = simulator_app().await;
         let res = app
             .oneshot(
                 Request::builder()
@@ -996,7 +1017,7 @@ mod simulator_tests {
 
     #[tokio::test]
     async fn test_simulate_release_http_404_unknown_vault() {
-        let app = simulator_app();
+        let app = simulator_app().await;
         let res = app
             .oneshot(
                 Request::builder()
@@ -1012,7 +1033,7 @@ mod simulator_tests {
 
     #[tokio::test]
     async fn test_simulate_release_http_422_bad_scenario() {
-        let app = simulator_app();
+        let app = simulator_app().await;
         let res = app
             .oneshot(
                 Request::builder()
@@ -1028,7 +1049,7 @@ mod simulator_tests {
 
     #[tokio::test]
     async fn test_simulate_release_http_with_missed_count() {
-        let app = simulator_app();
+        let app = simulator_app().await;
         let res = app
             .oneshot(
                 Request::builder()

@@ -55,7 +55,7 @@ pub async fn audit_middleware(
             })),
         };
 
-        if let Err(e) = db.insert_audit_log(&entry) {
+        if let Err(e) = db.insert_audit_log(&entry).await {
             tracing::error!(error = %e, "failed to persist audit log entry");
         }
     }
@@ -64,7 +64,7 @@ pub async fn audit_middleware(
 }
 
 /// Helper: write a structured audit entry for state modifications.
-pub fn log_state_modification(
+pub async fn log_state_modification(
     db: &Arc<Db>,
     action: &str,
     resource: &str,
@@ -82,7 +82,7 @@ pub fn log_state_modification(
         ip_address: extract_client_ip(headers),
         details,
     };
-    if let Err(e) = db.insert_audit_log(&entry) {
+    if let Err(e) = db.insert_audit_log(&entry).await {
         tracing::error!(error = %e, "failed to persist audit log entry");
     }
 }

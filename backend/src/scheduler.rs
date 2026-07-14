@@ -16,13 +16,13 @@ pub async fn run(db: Arc<Db>) {
         interval.tick().await;
 
         // 1) Existing reminder preferences scheduler.
-        match db.all() {
+        match db.all().await {
             Ok(all_prefs) => {
                 for prefs in all_prefs {
                     let ttl_hours = fetch_ttl_remaining(prefs.vault_id);
                     let window = prefs.hours_before_expiry;
 
-                    let subscription = db.get_subscription(prefs.vault_id).ok().flatten();
+                    let subscription = db.get_subscription(prefs.vault_id).await.ok().flatten();
 
                     use crate::models::SubscriptionFrequency;
                     let should_notify = if let Some(ref sub) = subscription {
@@ -87,12 +87,12 @@ pub async fn run(db: Arc<Db>) {
         }
 
         // 2) TTL insurance scheduler.
-        extend_ttl_for_inactive_owners(&db);
+        extend_ttl_for_inactive_owners(&db).await;
     }
 }
 
-fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
-    let policies = match db.all_enabled_insurance_policies() {
+async fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
+    let policies = match db.all_enabled_insurance_policies().await {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to fetch insurance policies");
@@ -106,7 +106,7 @@ fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
         if !policy.enabled {
             continue;
         }
-        let owner_last_active = match db.get_owner_last_active_at(policy.vault_id) {
+        let owner_last_active = match db.get_owner_last_active_at(policy.vault_id).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(
@@ -132,14 +132,17 @@ fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
             "TTL extended by insurance due to inactivity"
         );
 
-        if let Err(e) = db.upsert_insurance_policy(&crate::models::TtlInsurancePolicy {
-            vault_id: policy.vault_id,
-            extension_seconds: policy.extension_seconds,
-            inactivity_threshold_seconds: policy.inactivity_threshold_seconds,
-            enabled: true,
-            purchased_at: policy.purchased_at,
-            last_extended_at: Some(now),
-        }) {
+        if let Err(e) = db
+            .upsert_insurance_policy(&crate::models::TtlInsurancePolicy {
+                vault_id: policy.vault_id,
+                extension_seconds: policy.extension_seconds,
+                inactivity_threshold_seconds: policy.inactivity_threshold_seconds,
+                enabled: true,
+                purchased_at: policy.purchased_at,
+                last_extended_at: Some(now),
+            })
+            .await
+        {
             tracing::error!(
                 vault_id = policy.vault_id,
                 error = %e,

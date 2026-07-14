@@ -82,3 +82,56 @@ jobs:
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
             exit 1
           fi
+
+  backend:
+    name: Backend Test & Lint
+    runs-on: ubuntu-latest
+    # The backend persists reminder preferences, subscriptions, 2FA config,
+    # and audit trails to Postgres (see backend/src/db.rs). A real Postgres
+    # instance is required to build confidence that migrations and queries
+    # are valid, and to run the test suite (each test opens an isolated
+    # schema on this instance via Db::open_isolated).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ethos_user
+          POSTGRES_PASSWORD: ethos_password
+          POSTGRES_DB: ethos_protocol
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ethos_user -d ethos_protocol"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://ethos_user:ethos_password@localhost:5432/ethos_protocol
+      TEST_DATABASE_URL: postgres://ethos_user:ethos_password@localhost:5432/ethos_protocol
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match the contracts job (see comment above) so both jobs
+      # build against the same toolchain.
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-backend-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-backend-
+
+      - name: Build backend
+        run: cargo build --package ethos-protocol-backend
+
+      - name: Run backend tests
+        run: cargo test --package ethos-protocol-backend
+
+      - name: Run clippy (backend)
+        run: cargo clippy --package ethos-protocol-backend --all-targets -- -D warnings

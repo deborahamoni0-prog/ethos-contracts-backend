@@ -34,7 +34,7 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] crate::db::DbError),
     #[error("not found")]
     NotFound,
     #[error("invalid input: {0}")]

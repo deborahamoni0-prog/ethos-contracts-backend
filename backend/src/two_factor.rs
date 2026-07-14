@@ -177,7 +177,7 @@ pub async fn get_2fa_status(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
 ) -> Result<Json<TwoFactorStatusResponse>, AppError> {
-    let config = db.get_2fa_config(&vault_id)?;
+    let config = db.get_2fa_config(&vault_id).await?;
     let session_verified = SESSION_VERIFIED
         .lock()
         .unwrap()
@@ -244,7 +244,7 @@ pub async fn enable_2fa(
                 created_at: Utc::now(),
                 verified_at: None,
             };
-            db.upsert_2fa_config(&config)?;
+            db.upsert_2fa_config(&config).await?;
 
             Ok(Json(Enable2FAResponse {
                 vault_id,
@@ -282,7 +282,7 @@ pub async fn enable_2fa(
                 created_at: Utc::now(),
                 verified_at: None,
             };
-            db.upsert_2fa_config(&config)?;
+            db.upsert_2fa_config(&config).await?;
 
             tracing::info!(vault_id, phone, code, "SMS OTP sent");
 
@@ -322,7 +322,7 @@ pub async fn enable_2fa(
                 created_at: Utc::now(),
                 verified_at: None,
             };
-            db.upsert_2fa_config(&config)?;
+            db.upsert_2fa_config(&config).await?;
 
             tracing::info!(vault_id, email, code, "Email OTP sent");
 
@@ -342,7 +342,7 @@ pub async fn verify_2fa(
     Path(vault_id): Path<String>,
     Json(body): Json<Verify2FARequest>,
 ) -> Result<StatusCode, AppError> {
-    let config = db.get_2fa_config(&vault_id)?.ok_or(AppError::NotFound)?;
+    let config = db.get_2fa_config(&vault_id).await?.ok_or(AppError::NotFound)?;
 
     let valid = match &config.method {
         TwoFactorMethod::Totp => {
@@ -364,7 +364,7 @@ pub async fn verify_2fa(
         verified_at: Some(Utc::now()),
         ..config
     };
-    db.upsert_2fa_config(&updated)?;
+    db.upsert_2fa_config(&updated).await?;
 
     SESSION_VERIFIED.lock().unwrap().insert(vault_id, true);
 
@@ -376,7 +376,7 @@ pub async fn disable_2fa(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    db.delete_2fa_config(&vault_id)?;
+    db.delete_2fa_config(&vault_id).await?;
     SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
     PENDING_OTPS.lock().unwrap().remove(&vault_id);
     Ok(StatusCode::NO_CONTENT)
@@ -387,7 +387,7 @@ pub async fn challenge_2fa(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
 ) -> Result<Json<TwoFactorStatusResponse>, AppError> {
-    let config = db.get_2fa_config(&vault_id)?;
+    let config = db.get_2fa_config(&vault_id).await?;
     let session_verified = SESSION_VERIFIED
         .lock()
         .unwrap()

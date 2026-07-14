@@ -318,22 +318,14 @@ pub fn get_notification_preferences(
     notif_store.lock().unwrap().get(owner).cloned()
 }
 
-// ── TTL Insurance persistence (SQLite) ───────────────────────────────────────
+// ── TTL Insurance persistence (Postgres) ─────────────────────────────────────
 
 use crate::models::TtlInsurancePolicy;
 
 impl Db {
-    pub fn upsert_insurance_policy(
-        &self,
-        policy: &TtlInsurancePolicy,
-    ) -> Result<(), rusqlite::Error> {
-        // Store DateTimes as RFC3339 strings.
-        let purchased_at = policy.purchased_at.to_rfc3339();
-        let last_extended_at = policy.last_extended_at.map(|d| d.to_rfc3339());
-
-        let enabled_i = i64::from(policy.enabled);
-
-        self.conn.lock().unwrap().execute(
+    pub async fn upsert_insurance_policy(&self, policy: &TtlInsurancePolicy) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO ttl_insurance_policies (
                 vault_id,
@@ -342,201 +334,144 @@ impl Db {
                 enabled,
                 purchased_at,
                 last_extended_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(vault_id) DO UPDATE SET
-                extension_seconds = excluded.extension_seconds,
-                inactivity_threshold_seconds = excluded.inactivity_threshold_seconds,
-                enabled = excluded.enabled,
-                purchased_at = excluded.purchased_at,
-                last_extended_at = excluded.last_extended_at
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (vault_id) DO UPDATE SET
+                extension_seconds = EXCLUDED.extension_seconds,
+                inactivity_threshold_seconds = EXCLUDED.inactivity_threshold_seconds,
+                enabled = EXCLUDED.enabled,
+                purchased_at = EXCLUDED.purchased_at,
+                last_extended_at = EXCLUDED.last_extended_at
             ",
-            params![
-                policy.vault_id.cast_signed(),
-                policy.extension_seconds.cast_signed(),
-                policy.inactivity_threshold_seconds.cast_signed(),
-                enabled_i,
-                purchased_at,
-                last_extended_at,
+            &[
+                &policy.vault_id.cast_signed(),
+                &policy.extension_seconds.cast_signed(),
+                &policy.inactivity_threshold_seconds.cast_signed(),
+                &policy.enabled,
+                &policy.purchased_at,
+                &policy.last_extended_at,
             ],
-        )?;
+        )
+        .await?;
 
         Ok(())
     }
 
-    pub fn get_insurance_policy(
+    pub async fn get_insurance_policy(
         &self,
         vault_id: u64,
-    ) -> Result<Option<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"
+    ) -> Result<Option<TtlInsurancePolicy>, DbError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
             FROM ttl_insurance_policies
-            WHERE vault_id = ?1
+            WHERE vault_id = $1
             ",
-        )?;
+                &[&vault_id.cast_signed()],
+            )
+            .await?;
 
-        let row_res = stmt.query_row(params![vault_id.cast_signed()], |r| {
-            let purchased_at_str: String = r.get(4)?;
-            let purchased_at = chrono::DateTime::parse_from_rfc3339(&purchased_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-            let last_extended_at: Option<String> = r.get(5)?;
-            let last_extended_at_dt = match last_extended_at {
-                Some(s) => {
-                    let dt = chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?;
-                    Some(dt)
-                }
-                None => None,
-            };
-
-            let enabled_i: i64 = r.get(3)?;
-
-            Ok(TtlInsurancePolicy {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                extension_seconds: r.get::<_, i64>(1)? as u64,
-                inactivity_threshold_seconds: r.get::<_, i64>(2)? as u64,
-                enabled: enabled_i != 0,
-                purchased_at,
-                last_extended_at: last_extended_at_dt,
-            })
-        });
-
-        match row_res {
-            Ok(p) => Ok(Some(p)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(Some(TtlInsurancePolicy {
+            vault_id: row.try_get::<_, i64>(0)? as u64,
+            extension_seconds: row.try_get::<_, i64>(1)? as u64,
+            inactivity_threshold_seconds: row.try_get::<_, i64>(2)? as u64,
+            enabled: row.try_get(3)?,
+            purchased_at: row.try_get(4)?,
+            last_extended_at: row.try_get(5)?,
+        }))
     }
 
-    pub fn upsert_owner_activity(
+    pub async fn upsert_owner_activity(
         &self,
         owner_id: u64,
-        last_active_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        last_active_at: chrono::DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO owner_activity (owner_id, last_active_at)
-            VALUES (?1, ?2)
-            ON CONFLICT(owner_id) DO UPDATE SET
-                last_active_at = excluded.last_active_at
+            VALUES ($1, $2)
+            ON CONFLICT (owner_id) DO UPDATE SET
+                last_active_at = EXCLUDED.last_active_at
             ",
-            params![owner_id.cast_signed(), last_active_at.to_rfc3339(),],
-        )?;
+            &[&owner_id.cast_signed(), &last_active_at],
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn get_owner_last_active_at(
+    pub async fn get_owner_last_active_at(
         &self,
         owner_id: u64,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"
+    ) -> Result<Option<chrono::DateTime<Utc>>, DbError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                r"
             SELECT last_active_at
             FROM owner_activity
-            WHERE owner_id = ?1
+            WHERE owner_id = $1
             ",
-        )?;
+                &[&owner_id.cast_signed()],
+            )
+            .await?;
 
-        let row_res: Result<String, rusqlite::Error> =
-            stmt.query_row(params![owner_id.cast_signed()], |r| r.get(0));
-
-        match row_res {
-            Ok(s) => {
-                let dt = chrono::DateTime::parse_from_rfc3339(&s)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                Ok(Some(dt))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
+        match row {
+            Some(row) => Ok(Some(row.try_get(0)?)),
+            None => Ok(None),
         }
     }
 
-    pub fn all_enabled_insurance_policies(
-        &self,
-    ) -> Result<Vec<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"
+    pub async fn all_enabled_insurance_policies(&self) -> Result<Vec<TtlInsurancePolicy>, DbError> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
             FROM ttl_insurance_policies
-            WHERE enabled = 1
+            WHERE enabled = TRUE
             ",
-        )?;
+                &[],
+            )
+            .await?;
 
-        let iter = stmt.query_map([], |r| {
-            let purchased_at_str: String = r.get(4)?;
-            let purchased_at = chrono::DateTime::parse_from_rfc3339(&purchased_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-
-            let last_extended_at: Option<String> = r.get(5)?;
-            let last_extended_at_dt = match last_extended_at {
-                Some(s) => {
-                    let dt = chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?;
-                    Some(dt)
-                }
-                None => None,
-            };
-
-            let enabled_i: i64 = r.get(3)?;
-
-            Ok(TtlInsurancePolicy {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                extension_seconds: r.get::<_, i64>(1)? as u64,
-                inactivity_threshold_seconds: r.get::<_, i64>(2)? as u64,
-                enabled: enabled_i != 0,
-                purchased_at,
-                last_extended_at: last_extended_at_dt,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(TtlInsurancePolicy {
+                vault_id: row.try_get::<_, i64>(0)? as u64,
+                extension_seconds: row.try_get::<_, i64>(1)? as u64,
+                inactivity_threshold_seconds: row.try_get::<_, i64>(2)? as u64,
+                enabled: row.try_get(3)?,
+                purchased_at: row.try_get(4)?,
+                last_extended_at: row.try_get(5)?,
+            });
         }
         Ok(out)
     }
 }
 
-use rusqlite::{params, Connection};
+use bb8_postgres::PostgresConnectionManager;
+use tokio_postgres::NoTls;
+
+/// Errors surfaced by [`Db`]. Wraps both connection-pool acquisition failures
+/// and Postgres query errors behind a single type so callers (and
+/// `AppError::Db`) don't need to depend on `tokio-postgres`/`bb8` directly.
+#[derive(Debug, thiserror::Error)]
+pub enum DbError {
+    #[error("failed to acquire a database connection: {0}")]
+    Pool(#[from] bb8::RunError<tokio_postgres::Error>),
+    #[error("database query failed: {0}")]
+    Query(#[from] tokio_postgres::Error),
+    #[error("invalid data stored in database: {0}")]
+    Conversion(String),
+    #[error("no matching row found")]
+    NotFound,
+}
 
 pub struct PoolConfig {
     pub min: u32,
@@ -574,26 +509,72 @@ impl PoolConfig {
 }
 
 pub struct Db {
-    conn: std::sync::Mutex<Connection>,
-    // DB_POOL_MIN/DB_POOL_MAX are accepted for forward compatibility but unused:
-    // `conn` is a single mutex-guarded connection, not a real pool. Only
-    // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
-    #[allow(dead_code)]
+    pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     pool_config: PoolConfig,
     /// In-memory vault store shared across the application.
     pub vault_store: VaultStore,
 }
 
 impl Db {
-    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
-        Self::open_with_pool_config(path, &PoolConfig::default())
+    /// Open a connection pool against `database_url` (a Postgres connection
+    /// string, e.g. `postgres://user:pass@host:5432/dbname`) using default
+    /// pool settings.
+    pub async fn open(database_url: &str) -> Result<Self, DbError> {
+        Self::open_with_pool_config(database_url, &PoolConfig::default()).await
     }
 
-    pub fn open_with_pool_config(path: &str, config: &PoolConfig) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(config.timeout_secs as u64))?;
+    /// Open a connection pool against `database_url` using the given pool
+    /// sizing/timeout configuration (see [`PoolConfig::from_env`]).
+    pub async fn open_with_pool_config(
+        database_url: &str,
+        config: &PoolConfig,
+    ) -> Result<Self, DbError> {
+        let pg_config: tokio_postgres::Config = database_url.parse()?;
+        Self::build(pg_config, config).await
+    }
+
+    /// Test-only helper: opens a pool scoped to a freshly created, uniquely
+    /// named Postgres schema so that parallel tests (which all talk to the
+    /// same physical test database) don't collide with each other's rows.
+    /// The schema is created via a short-lived bootstrap connection and then
+    /// wired into the pool's connection options as `search_path`.
+    #[doc(hidden)]
+    pub async fn open_isolated(database_url: &str) -> Result<Self, DbError> {
+        let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+        let base_config: tokio_postgres::Config = database_url.parse()?;
+
+        // Bootstrap connection: create the schema before the pool starts
+        // issuing queries against it. tokio-postgres requires the
+        // connection's background I/O future to be polled independently, so
+        // spawn it; it exits on its own once `client` is dropped.
+        let (client, connection) = base_config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "bootstrap postgres connection closed with error");
+            }
+        });
+        client
+            .batch_execute(&format!(r#"CREATE SCHEMA IF NOT EXISTS "{schema}""#))
+            .await?;
+        drop(client);
+
+        let mut pg_config = base_config;
+        pg_config.options(format!("-c search_path={schema}"));
+
+        Self::build(pg_config, &PoolConfig::default()).await
+    }
+
+    async fn build(pg_config: tokio_postgres::Config, config: &PoolConfig) -> Result<Self, DbError> {
+        let manager = PostgresConnectionManager::new(pg_config, NoTls);
+        let max = config.max.max(config.min).max(1);
+        let pool = bb8::Pool::builder()
+            .min_idle(Some(config.min))
+            .max_size(max)
+            .connection_timeout(std::time::Duration::from_secs(u64::from(config.timeout_secs)))
+            .build(manager)
+            .await?;
         Ok(Self {
-            conn: std::sync::Mutex::new(conn),
+            pool,
             pool_config: PoolConfig {
                 min: config.min,
                 max: config.max,
@@ -601,6 +582,11 @@ impl Db {
             },
             vault_store: create_vault_store(),
         })
+    }
+
+    /// Pool sizing/timeout configuration this `Db` was opened with.
+    pub fn pool_config(&self) -> &PoolConfig {
+        &self.pool_config
     }
 
     /// Insert or replace a vault in the in-memory store.
@@ -616,53 +602,57 @@ impl Db {
         self.vault_store.lock().unwrap().get(vault_id).cloned()
     }
 
-    pub fn check_connectivity(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch("SELECT 1")?;
+    pub async fn check_connectivity(&self) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.batch_execute("SELECT 1").await?;
         Ok(())
     }
 
-    pub fn migrate(&self) -> Result<(), rusqlite::Error> {
+    pub async fn migrate(&self) -> Result<(), DbError> {
         // Bootstrap the migration tracking table before anything else.
-        self.conn.lock().unwrap().execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                version    TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            );",
-        )?;
+        {
+            let conn = self.pool.get().await?;
+            conn.batch_execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL
+                );",
+            )
+            .await?;
+        }
 
         const MIGRATIONS: &[(&str, &str)] = &[
             (
                 "1",
                 r"
                 CREATE TABLE IF NOT EXISTS reminder_preferences (
-                    vault_id             INTEGER PRIMARY KEY,
+                    vault_id             BIGINT PRIMARY KEY,
                     channels             TEXT NOT NULL,
-                    hours_before_expiry  INTEGER NOT NULL,
+                    hours_before_expiry  BIGINT NOT NULL,
                     frequency            TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS ttl_insurance_policies (
-                    vault_id                      INTEGER PRIMARY KEY,
-                    extension_seconds             INTEGER NOT NULL,
-                    inactivity_threshold_seconds  INTEGER NOT NULL,
-                    enabled                        INTEGER NOT NULL,
-                    purchased_at                   TEXT NOT NULL,
-                    last_extended_at               TEXT
+                    vault_id                      BIGINT PRIMARY KEY,
+                    extension_seconds             BIGINT NOT NULL,
+                    inactivity_threshold_seconds  BIGINT NOT NULL,
+                    enabled                        BOOLEAN NOT NULL,
+                    purchased_at                   TIMESTAMPTZ NOT NULL,
+                    last_extended_at               TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS owner_activity (
-                    owner_id       INTEGER PRIMARY KEY,
-                    last_active_at TEXT NOT NULL
+                    owner_id       BIGINT PRIMARY KEY,
+                    last_active_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS idempotency_keys (
                     key           TEXT PRIMARY KEY,
-                    status_code   INTEGER NOT NULL,
+                    status_code   BIGINT NOT NULL,
                     response_body TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
+                    created_at    TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS unsubscribe_tokens (
                     token      TEXT PRIMARY KEY,
                     owner      TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS unsubscribed_users (
                     owner TEXT PRIMARY KEY
@@ -671,20 +661,20 @@ impl Db {
             ),
             (
                 "2",
-                "ALTER TABLE reminder_preferences ADD COLUMN deleted_at TEXT;",
+                "ALTER TABLE reminder_preferences ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;",
             ),
             (
                 "3",
                 r"
                 CREATE TABLE IF NOT EXISTS audit_logs (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp  TEXT NOT NULL,
+                    id         BIGSERIAL PRIMARY KEY,
+                    timestamp  TIMESTAMPTZ NOT NULL,
                     user_id    TEXT NOT NULL DEFAULT '',
                     action     TEXT NOT NULL,
                     resource   TEXT NOT NULL DEFAULT '',
                     result     TEXT NOT NULL DEFAULT 'success',
                     ip_address TEXT NOT NULL DEFAULT '',
-                    details    TEXT
+                    details    JSONB
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id   ON audit_logs(user_id);
@@ -697,12 +687,12 @@ impl Db {
                 CREATE TABLE IF NOT EXISTS two_factor_config (
                     vault_id     TEXT PRIMARY KEY,
                     method       TEXT NOT NULL,
-                    enabled      INTEGER NOT NULL DEFAULT 0,
+                    enabled      BOOLEAN NOT NULL DEFAULT FALSE,
                     secret       TEXT,
                     phone        TEXT,
                     email        TEXT,
-                    created_at   TEXT NOT NULL,
-                    verified_at  TEXT
+                    created_at   TIMESTAMPTZ NOT NULL,
+                    verified_at  TIMESTAMPTZ
                 );
                 ",
             ),
@@ -710,7 +700,7 @@ impl Db {
                 "5",
                 r"
                 CREATE TABLE IF NOT EXISTS vault_subscriptions (
-                    vault_id   INTEGER PRIMARY KEY,
+                    vault_id   BIGINT PRIMARY KEY,
                     owner      TEXT NOT NULL,
                     channels   TEXT NOT NULL,
                     frequency  TEXT NOT NULL
@@ -719,26 +709,28 @@ impl Db {
             ),
         ];
 
-        for (version, sql) in MIGRATIONS {
+        for &(version, sql) in MIGRATIONS {
             let already_applied: bool = {
-                let conn = self.conn.lock().unwrap();
-                conn.query_row(
-                    "SELECT 1 FROM schema_migrations WHERE version = ?1",
-                    params![version],
-                    |_| Ok(true),
+                let conn = self.pool.get().await?;
+                conn.query_opt(
+                    "SELECT 1 FROM schema_migrations WHERE version = $1",
+                    &[&version],
                 )
-                .unwrap_or(false)
+                .await?
+                .is_some()
             };
 
             if already_applied {
                 tracing::debug!(version = version, "migration already applied, skipping");
             } else {
                 tracing::info!(version = version, "applying migration");
-                self.conn.lock().unwrap().execute_batch(sql)?;
-                self.conn.lock().unwrap().execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                    params![version, chrono::Utc::now().to_rfc3339()],
-                )?;
+                let conn = self.pool.get().await?;
+                conn.batch_execute(sql).await?;
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)",
+                    &[&version, &Utc::now()],
+                )
+                .await?;
                 tracing::info!(version = version, "migration applied successfully");
             }
         }
@@ -746,487 +738,476 @@ impl Db {
         Ok(())
     }
 
-    pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
+    pub async fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), DbError> {
         let channels_json = serde_json::to_string(&prefs.channels).unwrap();
-        self.conn.lock().unwrap().execute(
+        let frequency_json = serde_json::to_string(&prefs.frequency).unwrap();
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO reminder_preferences (vault_id, channels, hours_before_expiry, frequency)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(vault_id) DO UPDATE SET
-              channels = excluded.channels,
-              hours_before_expiry = excluded.hours_before_expiry,
-              frequency = excluded.frequency,
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vault_id) DO UPDATE SET
+              channels = EXCLUDED.channels,
+              hours_before_expiry = EXCLUDED.hours_before_expiry,
+              frequency = EXCLUDED.frequency,
               deleted_at = NULL
             ",
-            params![
-                prefs.vault_id.cast_signed(),
-                channels_json,
-                prefs.hours_before_expiry as i64,
-                serde_json::to_string(&prefs.frequency).unwrap(),
+            &[
+                &prefs.vault_id.cast_signed(),
+                &channels_json,
+                &i64::from(prefs.hours_before_expiry),
+                &frequency_json,
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+    pub async fn get(&self, vault_id: u64) -> Result<ReminderPreferences, DbError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
-               WHERE vault_id = ?1 AND deleted_at IS NULL",
-        )?;
-        let row = stmt.query_row(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at: None,
-            })
-        })?;
-        Ok(row)
+               WHERE vault_id = $1 AND deleted_at IS NULL",
+                &[&vault_id.cast_signed()],
+            )
+            .await?;
+        let row = row.ok_or(DbError::NotFound)?;
+
+        let channels_str: String = row.try_get(1)?;
+        let frequency_str: String = row.try_get(3)?;
+        let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+        let frequency: Frequency =
+            serde_json::from_str(&frequency_str).map_err(|e| DbError::Conversion(e.to_string()))?;
+        Ok(ReminderPreferences {
+            vault_id: row.try_get::<_, i64>(0)? as u64,
+            channels,
+            hours_before_expiry: row.try_get::<_, i64>(2)? as u32,
+            frequency,
+            deleted_at: None,
+        })
     }
 
-    pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+    pub async fn all(&self) -> Result<Vec<ReminderPreferences>, DbError> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE deleted_at IS NULL",
-        )?;
-        let iter = stmt.query_map([], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
+                &[],
+            )
+            .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let channels_str: String = row.try_get(1)?;
+            let frequency_str: String = row.try_get(3)?;
             let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
+            let frequency: Frequency = serde_json::from_str(&frequency_str)
+                .map_err(|e| DbError::Conversion(e.to_string()))?;
+            out.push(ReminderPreferences {
+                vault_id: row.try_get::<_, i64>(0)? as u64,
                 channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                hours_before_expiry: row.try_get::<_, i64>(2)? as u32,
                 frequency,
                 deleted_at: None,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
+            });
         }
         Ok(out)
     }
 
-    pub fn soft_delete_reminder(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE reminder_preferences SET deleted_at = ?1 WHERE vault_id = ?2 AND deleted_at IS NULL",
-            params![chrono::Utc::now().to_rfc3339(), vault_id.cast_signed()],
-        )?;
+    pub async fn soft_delete_reminder(&self, vault_id: u64) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "UPDATE reminder_preferences SET deleted_at = $1 WHERE vault_id = $2 AND deleted_at IS NULL",
+            &[&Utc::now(), &vault_id.cast_signed()],
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn all_reminders_including_deleted(
+    pub async fn all_reminders_including_deleted(
         &self,
         vault_id: u64,
-    ) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+    ) -> Result<Vec<ReminderPreferences>, DbError> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
-               WHERE vault_id = ?1",
-        )?;
-        let iter = stmt.query_map(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
+               WHERE vault_id = $1",
+                &[&vault_id.cast_signed()],
+            )
+            .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let channels_str: String = row.try_get(1)?;
+            let frequency_str: String = row.try_get(3)?;
             let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            let deleted_at_str: Option<String> = r.get(4)?;
-            let deleted_at = deleted_at_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-            });
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
+            let frequency: Frequency = serde_json::from_str(&frequency_str)
+                .map_err(|e| DbError::Conversion(e.to_string()))?;
+            let deleted_at: Option<chrono::DateTime<Utc>> = row.try_get(4)?;
+            out.push(ReminderPreferences {
+                vault_id: row.try_get::<_, i64>(0)? as u64,
                 channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                hours_before_expiry: row.try_get::<_, i64>(2)? as u32,
                 frequency,
                 deleted_at,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
+            });
         }
         Ok(out)
     }
 
-    pub fn upsert_subscription(&self, sub: &Subscription) -> Result<(), rusqlite::Error> {
+    pub async fn upsert_subscription(&self, sub: &Subscription) -> Result<(), DbError> {
         let channels_json = serde_json::to_string(&sub.channels).unwrap();
         let frequency_json = serde_json::to_string(&sub.frequency).unwrap();
-        self.conn.lock().unwrap().execute(
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO vault_subscriptions (vault_id, owner, channels, frequency)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(vault_id) DO UPDATE SET
-              owner = excluded.owner,
-              channels = excluded.channels,
-              frequency = excluded.frequency
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vault_id) DO UPDATE SET
+              owner = EXCLUDED.owner,
+              channels = EXCLUDED.channels,
+              frequency = EXCLUDED.frequency
             ",
-            params![
-                sub.vault_id.cast_signed(),
-                sub.owner,
-                channels_json,
-                frequency_json,
+            &[
+                &sub.vault_id.cast_signed(),
+                &sub.owner,
+                &channels_json,
+                &frequency_json,
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn delete_subscription(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM vault_subscriptions WHERE vault_id = ?1",
-            params![vault_id.cast_signed()],
-        )?;
+    pub async fn delete_subscription(&self, vault_id: u64) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "DELETE FROM vault_subscriptions WHERE vault_id = $1",
+            &[&vault_id.cast_signed()],
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn get_subscription(&self, vault_id: u64) -> Result<Option<Subscription>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, owner, channels, frequency
+    pub async fn get_subscription(&self, vault_id: u64) -> Result<Option<Subscription>, DbError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                r"SELECT vault_id, owner, channels, frequency
                FROM vault_subscriptions
-               WHERE vault_id = ?1",
-        )?;
-        let row = stmt.query_row(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(2)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<SubscriptionChannel> =
-                serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: SubscriptionFrequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(Subscription {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                owner: r.get(1)?,
-                channels,
-                frequency,
-            })
-        });
-        match row {
-            Ok(sub) => Ok(Some(sub)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+               WHERE vault_id = $1",
+                &[&vault_id.cast_signed()],
+            )
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let channels_str: String = row.try_get(2)?;
+        let frequency_str: String = row.try_get(3)?;
+        let channels: Vec<SubscriptionChannel> =
+            serde_json::from_str(&channels_str).unwrap_or_default();
+        let frequency: SubscriptionFrequency =
+            serde_json::from_str(&frequency_str).map_err(|e| DbError::Conversion(e.to_string()))?;
+        Ok(Some(Subscription {
+            vault_id: row.try_get::<_, i64>(0)? as u64,
+            owner: row.try_get(1)?,
+            channels,
+            frequency,
+        }))
     }
 
     // ── Idempotency (#825) ──────────────────────────────────────────────────
 
-    pub fn store_idempotency(&self, key: &str, status_code: u16, response_body: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            r"INSERT OR REPLACE INTO idempotency_keys (key, status_code, response_body, created_at)
-               VALUES (?1, ?2, ?3, ?4)",
-            params![
-                key,
-                status_code as i64,
-                response_body,
-                chrono::Utc::now().to_rfc3339()
-            ],
-        );
+    pub async fn store_idempotency(&self, key: &str, status_code: u16, response_body: &str) {
+        let Ok(conn) = self.pool.get().await else {
+            return;
+        };
+        let _ = conn
+            .execute(
+                r"
+            INSERT INTO idempotency_keys (key, status_code, response_body, created_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (key) DO UPDATE SET
+              status_code = EXCLUDED.status_code,
+              response_body = EXCLUDED.response_body,
+              created_at = EXCLUDED.created_at
+            ",
+                &[&key, &i64::from(status_code), &response_body, &Utc::now()],
+            )
+            .await;
     }
 
-    pub fn check_idempotency(&self, key: &str) -> Option<crate::models::IdempotencyRecord> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding
-            .prepare("SELECT key, status_code, response_body, created_at FROM idempotency_keys WHERE key = ?1")
-            .ok()?;
-        stmt.query_row(params![key], |r| {
-            let created_str: String = r.get(3)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let age = chrono::Utc::now()
-                .signed_duration_since(created_at)
-                .num_seconds();
-            if age > 86_400 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-            Ok(crate::models::IdempotencyRecord {
-                key: r.get(0)?,
-                status_code: r.get::<_, i64>(1)? as u16,
-                response_body: r.get(2)?,
-                created_at,
-            })
+    pub async fn check_idempotency(&self, key: &str) -> Option<crate::models::IdempotencyRecord> {
+        let conn = self.pool.get().await.ok()?;
+        let row = conn
+            .query_opt(
+                "SELECT key, status_code, response_body, created_at FROM idempotency_keys WHERE key = $1",
+                &[&key],
+            )
+            .await
+            .ok()??;
+
+        let created_at: chrono::DateTime<Utc> = row.try_get(3).ok()?;
+        let age = Utc::now().signed_duration_since(created_at).num_seconds();
+        if age > 86_400 {
+            return None;
+        }
+        Some(crate::models::IdempotencyRecord {
+            key: row.try_get(0).ok()?,
+            status_code: row.try_get::<_, i64>(1).ok()? as u16,
+            response_body: row.try_get(2).ok()?,
+            created_at,
         })
-        .ok()
     }
 
     // ── Unsubscribe (#828) ──────────────────────────────────────────────────
 
-    pub fn store_unsubscribe_token(&self, token: &str, owner: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            r"INSERT OR REPLACE INTO unsubscribe_tokens (token, owner, created_at)
-               VALUES (?1, ?2, ?3)",
-            params![token, owner, chrono::Utc::now().to_rfc3339()],
-        );
+    pub async fn store_unsubscribe_token(&self, token: &str, owner: &str) {
+        let Ok(conn) = self.pool.get().await else {
+            return;
+        };
+        let _ = conn
+            .execute(
+                r"
+            INSERT INTO unsubscribe_tokens (token, owner, created_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (token) DO UPDATE SET
+              owner = EXCLUDED.owner,
+              created_at = EXCLUDED.created_at
+            ",
+                &[&token, &owner, &Utc::now()],
+            )
+            .await;
     }
 
-    pub fn process_unsubscribe(&self, token: &str) -> Result<String, String> {
-        let conn = self.conn.lock().unwrap();
-        let owner: String = conn
-            .query_row(
-                "SELECT owner FROM unsubscribe_tokens WHERE token = ?1",
-                params![token],
-                |r| r.get(0),
+    pub async fn process_unsubscribe(&self, token: &str) -> Result<String, String> {
+        let conn = self.pool.get().await.map_err(|e| e.to_string())?;
+        let row = conn
+            .query_opt(
+                "SELECT owner FROM unsubscribe_tokens WHERE token = $1",
+                &[&token],
             )
-            .map_err(|_| "invalid or expired unsubscribe token".to_string())?;
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "invalid or expired unsubscribe token".to_string())?;
+        let owner: String = row.try_get(0).map_err(|e| e.to_string())?;
 
         conn.execute(
-            "INSERT OR IGNORE INTO unsubscribed_users (owner) VALUES (?1)",
-            params![&owner],
+            "INSERT INTO unsubscribed_users (owner) VALUES ($1) ON CONFLICT (owner) DO NOTHING",
+            &[&owner],
         )
+        .await
         .map_err(|e| e.to_string())?;
 
         Ok(owner)
     }
 
-    pub fn is_unsubscribed(&self, owner: &str) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT 1 FROM unsubscribed_users WHERE owner = ?1",
-                params![owner],
-                |_| Ok(()),
-            )
-            .is_ok()
+    pub async fn is_unsubscribed(&self, owner: &str) -> bool {
+        let Ok(conn) = self.pool.get().await else {
+            return false;
+        };
+        conn.query_opt(
+            "SELECT 1 FROM unsubscribed_users WHERE owner = $1",
+            &[&owner],
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
     }
 
-    pub fn generate_unsubscribe_token(&self, owner: &str) -> String {
+    pub async fn generate_unsubscribe_token(&self, owner: &str) -> String {
         let token = uuid::Uuid::new_v4().to_string();
-        self.store_unsubscribe_token(&token, owner);
+        self.store_unsubscribe_token(&token, owner).await;
         token
     }
 
     // ── 2FA operations (#965) ───────────────────────────────────────────────
 
-    pub fn upsert_2fa_config(&self, config: &TwoFactorConfig) -> Result<(), rusqlite::Error> {
-        let enabled_i = i64::from(config.enabled);
-        let verified_at = config.verified_at.map(|d| d.to_rfc3339());
+    pub async fn upsert_2fa_config(&self, config: &TwoFactorConfig) -> Result<(), DbError> {
         let method_str = serde_json::to_string(&config.method).unwrap();
-
-        self.conn.lock().unwrap().execute(
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO two_factor_config (vault_id, method, enabled, secret, phone, email, created_at, verified_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(vault_id) DO UPDATE SET
-                method = excluded.method,
-                enabled = excluded.enabled,
-                secret = excluded.secret,
-                phone = excluded.phone,
-                email = excluded.email,
-                created_at = excluded.created_at,
-                verified_at = excluded.verified_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (vault_id) DO UPDATE SET
+                method = EXCLUDED.method,
+                enabled = EXCLUDED.enabled,
+                secret = EXCLUDED.secret,
+                phone = EXCLUDED.phone,
+                email = EXCLUDED.email,
+                created_at = EXCLUDED.created_at,
+                verified_at = EXCLUDED.verified_at
             ",
-            params![
-                config.vault_id,
-                method_str,
-                enabled_i,
-                config.secret,
-                config.phone,
-                config.email,
-                config.created_at.to_rfc3339(),
-                verified_at,
+            &[
+                &config.vault_id,
+                &method_str,
+                &config.enabled,
+                &config.secret,
+                &config.phone,
+                &config.email,
+                &config.created_at,
+                &config.verified_at,
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn get_2fa_config(
-        &self,
-        vault_id: &str,
-    ) -> Result<Option<TwoFactorConfig>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"
+    pub async fn get_2fa_config(&self, vault_id: &str) -> Result<Option<TwoFactorConfig>, DbError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                r"
             SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at
             FROM two_factor_config
-            WHERE vault_id = ?1
+            WHERE vault_id = $1
             ",
-        )?;
+                &[&vault_id],
+            )
+            .await?;
 
-        let row_res = stmt.query_row(params![vault_id], |r| {
-            let method_str: String = r.get(1)?;
-            let method: TwoFactorMethod = serde_json::from_str(&method_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
-            let enabled_i: i64 = r.get(2)?;
-            let created_at_str: String = r.get(6)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let verified_at_str: Option<String> = r.get(7)?;
-            let verified_at = verified_at_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-            });
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-            Ok(TwoFactorConfig {
-                vault_id: r.get(0)?,
-                method,
-                enabled: enabled_i != 0,
-                secret: r.get(3)?,
-                phone: r.get(4)?,
-                email: r.get(5)?,
-                created_at,
-                verified_at,
-            })
-        });
+        let method_str: String = row.try_get(1)?;
+        let method: TwoFactorMethod =
+            serde_json::from_str(&method_str).map_err(|e| DbError::Conversion(e.to_string()))?;
 
-        match row_res {
-            Ok(c) => Ok(Some(c)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(Some(TwoFactorConfig {
+            vault_id: row.try_get(0)?,
+            method,
+            enabled: row.try_get(2)?,
+            secret: row.try_get(3)?,
+            phone: row.try_get(4)?,
+            email: row.try_get(5)?,
+            created_at: row.try_get(6)?,
+            verified_at: row.try_get(7)?,
+        }))
     }
 
-    pub fn delete_2fa_config(&self, vault_id: &str) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM two_factor_config WHERE vault_id = ?1",
-            params![vault_id],
-        )?;
+    pub async fn delete_2fa_config(&self, vault_id: &str) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "DELETE FROM two_factor_config WHERE vault_id = $1",
+            &[&vault_id],
+        )
+        .await?;
         Ok(())
     }
 
     // ── Audit Log persistence (#961) ─────────────────────────────────────────
 
-    pub fn insert_audit_log(&self, entry: &AuditLogEntry) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+    pub async fn insert_audit_log(&self, entry: &AuditLogEntry) -> Result<(), DbError> {
+        let conn = self.pool.get().await?;
+        conn.execute(
             r"
             INSERT INTO audit_logs (timestamp, user_id, action, resource, result, ip_address, details)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ",
-            params![
-                entry.timestamp.to_rfc3339(),
-                entry.user_id,
-                entry.action,
-                entry.resource,
-                entry.result,
-                entry.ip_address,
-                entry.details.as_ref().map(std::string::ToString::to_string),
+            &[
+                &entry.timestamp,
+                &entry.user_id,
+                &entry.action,
+                &entry.resource,
+                &entry.result,
+                &entry.ip_address,
+                &entry.details,
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn query_audit_logs(
-        &self,
-        query: &AuditLogQuery,
-    ) -> Result<Vec<AuditLogEntry>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn query_audit_logs(&self, query: &AuditLogQuery) -> Result<Vec<AuditLogEntry>, DbError> {
+        use std::fmt::Write as _;
+
+        let conn = self.pool.get().await?;
 
         let mut sql = String::from(
             "SELECT id, timestamp, user_id, action, resource, result, ip_address, details FROM audit_logs WHERE 1=1"
         );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+        let mut idx: usize = 1;
 
         if let Some(ref user_id) = query.user_id {
-            sql.push_str(" AND user_id = ?");
+            let _ = write!(sql, " AND user_id = ${idx}");
             param_values.push(Box::new(user_id.clone()));
+            idx += 1;
         }
         if let Some(ref action) = query.action {
-            sql.push_str(" AND action = ?");
+            let _ = write!(sql, " AND action = ${idx}");
             param_values.push(Box::new(action.clone()));
+            idx += 1;
         }
         if let Some(ref resource) = query.resource {
-            sql.push_str(" AND resource = ?");
+            let _ = write!(sql, " AND resource = ${idx}");
             param_values.push(Box::new(resource.clone()));
+            idx += 1;
         }
         if let Some(ref result_val) = query.result {
-            sql.push_str(" AND result = ?");
+            let _ = write!(sql, " AND result = ${idx}");
             param_values.push(Box::new(result_val.clone()));
+            idx += 1;
         }
         if let Some(after) = query.after {
-            sql.push_str(" AND timestamp >= ?");
-            param_values.push(Box::new(after.to_rfc3339()));
+            let _ = write!(sql, " AND timestamp >= ${idx}");
+            param_values.push(Box::new(after));
+            idx += 1;
         }
         if let Some(before) = query.before {
-            sql.push_str(" AND timestamp <= ?");
-            param_values.push(Box::new(before.to_rfc3339()));
+            let _ = write!(sql, " AND timestamp <= ${idx}");
+            param_values.push(Box::new(before));
+            idx += 1;
         }
 
         sql.push_str(" ORDER BY timestamp DESC");
 
         let limit = query.limit.unwrap_or(100);
         let offset = query.offset.unwrap_or(0);
-        sql.push_str(" LIMIT ? OFFSET ?");
+        let _ = write!(sql, " LIMIT ${idx} OFFSET ${}", idx + 1);
         param_values.push(Box::new(limit));
         param_values.push(Box::new(offset));
 
-        let params: Vec<&dyn rusqlite::types::ToSql> = param_values
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
             .iter()
             .map(std::convert::AsRef::as_ref)
             .collect();
-        let mut stmt = conn.prepare(&sql)?;
 
-        let rows = stmt.query_map(params.as_slice(), |r| {
-            let timestamp_str: String = r.get(1)?;
-            let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let details_str: Option<String> = r.get(7)?;
-            let details = details_str.and_then(|s| serde_json::from_str(&s).ok());
+        let rows = conn.query(&sql, params.as_slice()).await?;
 
-            Ok(AuditLogEntry {
-                id: r.get(0)?,
-                timestamp,
-                user_id: r.get(2)?,
-                action: r.get(3)?,
-                resource: r.get(4)?,
-                result: r.get(5)?,
-                ip_address: r.get(6)?,
-                details,
-            })
-        })?;
-
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(row?);
+            out.push(AuditLogEntry {
+                id: row.try_get(0)?,
+                timestamp: row.try_get(1)?,
+                user_id: row.try_get(2)?,
+                action: row.try_get(3)?,
+                resource: row.try_get(4)?,
+                result: row.try_get(5)?,
+                ip_address: row.try_get(6)?,
+                details: row.try_get(7)?,
+            });
         }
         Ok(out)
     }
 
-    pub fn purge_old_audit_logs(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
-        let count = self.conn.lock().unwrap().execute(
-            "DELETE FROM audit_logs WHERE timestamp < ?1",
-            params![cutoff],
-        )?;
-        Ok(count as u64)
+    pub async fn purge_old_audit_logs(&self, retention_days: i64) -> Result<u64, DbError> {
+        let cutoff = Utc::now() - chrono::Duration::days(retention_days);
+        let conn = self.pool.get().await?;
+        let count = conn
+            .execute("DELETE FROM audit_logs WHERE timestamp < $1", &[&cutoff])
+            .await?;
+        Ok(count)
     }
 }
 

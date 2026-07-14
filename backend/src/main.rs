@@ -55,7 +55,7 @@ async fn health_handler() -> Json<serde_json::Value> {
 async fn ready_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
+    match state.db.check_connectivity().await {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
@@ -152,9 +152,27 @@ async fn main() {
         "database pool configuration"
     );
 
-    let db =
-        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
-    db.migrate().expect("migration failed");
+    // Fail fast rather than silently falling back to an ephemeral database:
+    // DATABASE_URL must point at a real Postgres instance for vault
+    // reminder preferences, subscriptions, and audit trails to persist
+    // across restarts.
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        tracing::error!(
+            "DATABASE_URL is not set. Refusing to start: without it, data would not persist \
+             across restarts. Set DATABASE_URL to a Postgres connection string, e.g. \
+             postgres://user:password@host:5432/dbname"
+        );
+        std::process::exit(1);
+    });
+
+    let db = match Db::open_with_pool_config(&database_url, &pool_config).await {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to open database connection pool");
+            std::process::exit(1);
+        }
+    };
+    db.migrate().await.expect("migration failed");
 
     let consensus = NodeCache::from_env();
     tracing::info!(

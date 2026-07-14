@@ -7,15 +7,18 @@
 # are configured accordingly (context: ., dockerfile: backend/Dockerfile).
 #
 # Runtime environment variables (see .env.example):
-#   ALLOWED_ORIGINS, MIN_CONTRACT_VERSION, DB_POOL_MIN, DB_POOL_MAX,
+#   DATABASE_URL, ALLOWED_ORIGINS, MIN_CONTRACT_VERSION, DB_POOL_MIN, DB_POOL_MAX,
 #   DB_POOL_TIMEOUT_SECS, NOTIFICATION_SCHEDULER_INTERVAL_SECS,
 #   FCM_SERVER_KEY, FCM_PROJECT_ID, REMINDER_EMAIL_API_KEY, REMINDER_SMS_API_KEY,
 #   REMINDER_ENCRYPTION_SECRET
 # Additional vars read by the backend but not yet documented in .env.example:
 #   NODE_ID, CONSENSUS_STRATEGY, REDIS_URL, ADMIN_API_KEY
-# NOTE: the backend currently opens SQLite at ":memory:" (backend/src/main.rs) --
-# DATABASE_URL / the Postgres service in docker-compose.yml are not read by this
-# binary. Vault data does not persist across container restarts.
+# NOTE: the backend connects to Postgres via DATABASE_URL (backend/src/main.rs,
+# backend/src/db.rs). DATABASE_URL is required at startup -- the process exits
+# immediately if it is unset, rather than silently falling back to an
+# ephemeral database. docker-compose.yml's `db` service supplies it, and
+# reminder preferences / subscriptions / audit trails persist across backend
+# container restarts as long as the `postgres_data` volume persists.
 
 ARG RUST_VERSION=1.96.1
 
