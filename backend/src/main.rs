@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
     consensus::NodeCache,
+    contract_rpc::get_deployed_contract_version,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
@@ -122,11 +123,23 @@ async fn main() {
     let min_contract_version =
         parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());
 
+    // Required at startup so we can verify the deployed ttl_vault contract's
+    // on-chain version before accepting traffic; unlike MIN_CONTRACT_VERSION
+    // there's no safe default to fall back to for *which* RPC endpoint/
+    // contract to check, so a missing value fails the check below rather
+    // than being silently assumed.
+    let stellar_rpc_url = std::env::var("STELLAR_RPC_URL").ok();
+    let contract_ttl_vault = std::env::var("CONTRACT_TTL_VAULT").ok();
+
     let version_result = check_contract_version(
         || async {
-            // TODO: replace with real Soroban client call when available
-            // For now, this is a stub that returns Ok(1) so startup proceeds
-            Ok::<u32, String>(1)
+            let rpc_url = stellar_rpc_url
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "STELLAR_RPC_URL is not set".to_string())?;
+            let contract_id = contract_ttl_vault
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "CONTRACT_TTL_VAULT is not set".to_string())?;
+            get_deployed_contract_version(&rpc_url, &contract_id).await
         },
         min_contract_version,
     )

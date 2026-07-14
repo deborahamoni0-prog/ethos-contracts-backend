@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod cache;
 pub mod consensus;
+pub mod contract_rpc;
 pub mod contract_version_check;
 pub mod db;
 pub mod error;

@@ -1096,6 +1096,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.6",
+ "stellar-strkey",
+ "stellar-xdr",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",

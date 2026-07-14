@@ -7,12 +7,19 @@
 # are configured accordingly (context: ., dockerfile: backend/Dockerfile).
 #
 # Runtime environment variables (see .env.example):
-#   ALLOWED_ORIGINS, MIN_CONTRACT_VERSION, DB_POOL_MIN, DB_POOL_MAX,
-#   DB_POOL_TIMEOUT_SECS, NOTIFICATION_SCHEDULER_INTERVAL_SECS,
-#   FCM_SERVER_KEY, FCM_PROJECT_ID, REMINDER_EMAIL_API_KEY, REMINDER_SMS_API_KEY,
-#   REMINDER_ENCRYPTION_SECRET
+#   ALLOWED_ORIGINS, MIN_CONTRACT_VERSION, STELLAR_RPC_URL, CONTRACT_TTL_VAULT,
+#   DB_POOL_MIN, DB_POOL_MAX, DB_POOL_TIMEOUT_SECS,
+#   NOTIFICATION_SCHEDULER_INTERVAL_SECS, FCM_SERVER_KEY, FCM_PROJECT_ID,
+#   REMINDER_EMAIL_API_KEY, REMINDER_SMS_API_KEY, REMINDER_ENCRYPTION_SECRET
 # Additional vars read by the backend but not yet documented in .env.example:
 #   NODE_ID, CONSENSUS_STRATEGY, REDIS_URL, ADMIN_API_KEY
+# NOTE: STELLAR_RPC_URL and CONTRACT_TTL_VAULT are required -- at startup the
+# backend calls the deployed ttl_vault contract's get_contract_version() over
+# Soroban RPC (backend/src/contract_rpc.rs) and refuses to start if either var
+# is unset, the RPC endpoint is unreachable, or the on-chain version is below
+# MIN_CONTRACT_VERSION. docker-compose.yml does not currently set these two
+# vars, so `docker-compose up` needs them added to environment: before the
+# backend container will start.
 # NOTE: the backend currently opens SQLite at ":memory:" (backend/src/main.rs) --
 # DATABASE_URL / the Postgres service in docker-compose.yml are not read by this
 # binary. Vault data does not persist across container restarts.

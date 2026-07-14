@@ -48,6 +48,18 @@ hmac = "0.12"
 sha1 = "0.10"
 once_cell = "1"
 
+# Soroban RPC contract-version check at startup (contract_rpc.rs). We build the
+# read-only `simulateTransaction` request by hand with stellar-xdr + the
+# reqwest client above rather than depending on the `soroban-client` crate:
+# that crate pulls in reqwest 0.11 with its default native-tls/OpenSSL
+# backend, which would require system OpenSSL headers we don't otherwise need
+# (this backend only links rustls). stellar-xdr/stellar-strkey are pure XDR
+# types with no networking or TLS dependencies. Version pinned to match what
+# soroban-sdk (via the contracts workspace member) already resolves to, to
+# avoid a duplicate copy in the dependency graph.
+stellar-xdr = { version = "=21.2.0", features = ["base64"] }
+stellar-strkey = "0.0.8"
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockito = "1.4"
