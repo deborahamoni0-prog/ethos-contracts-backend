@@ -88,10 +88,18 @@ pub fn log_state_modification(
 }
 
 /// Check that the request carries a valid admin API key.
+///
+/// Fails closed: if `ADMIN_API_KEY` is not configured, every request is
+/// rejected rather than treated as authorized. An unset key must never be
+/// interpreted as "no admin auth required" in a production deployment.
 pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return Ok(());
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "admin API key is not configured",
+        ));
     }
     let auth_header = headers
         .get("authorization")

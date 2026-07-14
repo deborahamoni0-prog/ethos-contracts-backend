@@ -284,7 +284,10 @@ pub async fn enable_2fa(
             };
             db.upsert_2fa_config(&config)?;
 
-            tracing::info!(vault_id, phone, code, "SMS OTP sent");
+            // Never log the OTP code or the raw phone number: both are
+            // sensitive (the code defeats 2FA if it lands in logs; the phone
+            // number is PII). Log only enough to correlate support requests.
+            tracing::info!(vault_id, "SMS OTP sent");
 
             Ok(Json(Enable2FAResponse {
                 vault_id,
@@ -324,7 +327,10 @@ pub async fn enable_2fa(
             };
             db.upsert_2fa_config(&config)?;
 
-            tracing::info!(vault_id, email, code, "Email OTP sent");
+            // Never log the OTP code or the raw email address: both are
+            // sensitive (the code defeats 2FA if it lands in logs; the email
+            // address is PII). Log only enough to correlate support requests.
+            tracing::info!(vault_id, "Email OTP sent");
 
             Ok(Json(Enable2FAResponse {
                 vault_id,
