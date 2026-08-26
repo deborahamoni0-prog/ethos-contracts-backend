@@ -43,6 +43,32 @@ fn setup() -> (
 // ---- existing tests ----
 
 #[test]
+fn test_regenerating_backup_codes_invalidates_previous_generation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let first_generation = client.generate_backup_codes(&vault_id, &owner);
+    let old_code = first_generation.get(0).unwrap();
+
+    let second_generation = client.generate_backup_codes(&vault_id, &owner);
+    assert_ne!(old_code, second_generation.get(0).unwrap());
+
+    let error = client
+        .try_use_backup_code(&vault_id, &old_code)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidBackupCode as u32)
+    );
+
+    client.use_backup_code(&vault_id, &second_generation.get(0).unwrap());
+
+    // Keep `env` live for the generated Soroban values in this test.
+    let _ = env;
+}
+
+#[test]
 fn test_initialize_guard_against_double_init() {
     let (env, _, _, admin, token_address, client) = setup();
 
