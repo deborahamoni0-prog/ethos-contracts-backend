@@ -14903,6 +14903,9 @@ impl TtlVaultContract {
 
     /// Initialize a credential with Draft state.
     ///
+    /// No-op if the credential already has a state, so an existing (including
+    /// Revoked/Archived) credential can never be reset back to Draft.
+    ///
     /// # Arguments
     /// * `credential_id` - The credential ID to initialize
     ///
