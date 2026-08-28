@@ -1,8 +1,8 @@
-/// Generic query-result cache with per-entry TTL support.
+/// Generic query-result cache with per-entry TTL support and domain invalidation helpers.
 ///
 /// `QueryCache` stores arbitrary `serde_json::Value` results keyed by a
-/// caller-supplied string.  Entries expire after the configured TTL and are
-/// lazily evicted on the next access.  Hit/miss counters use `AtomicU64` so
+/// caller-supplied string. Entries expire after the configured TTL and are
+/// lazily evicted on the next access. Hit/miss counters use `AtomicU64` so
 /// they can be incremented without holding the inner `Mutex`.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,68 @@ use serde_json::Value;
 
 /// Default cache time-to-live: 60 seconds.
 pub const DEFAULT_TTL_SECS: u64 = 60;
+
+// ── QueryCacheKey ─────────────────────────────────────────────────────────────
+
+/// Standard cache key formats used across handlers for consistent caching and invalidation.
+pub struct QueryCacheKey;
+
+impl QueryCacheKey {
+    /// Cache key for vault summary: `vault:{vault_id}:summary`.
+    pub fn vault_summary(vault_id: &str) -> String {
+        format!("vault:{vault_id}:summary")
+    }
+
+    /// Cache key for vault TTL remaining: `vault:{vault_id}:ttl`.
+    pub fn vault_ttl(vault_id: &str) -> String {
+        format!("vault:{vault_id}:ttl")
+    }
+
+    /// Cache key for vault reminder preferences: `vault:{vault_id}:prefs`.
+    pub fn vault_prefs(vault_id: &str) -> String {
+        format!("vault:{vault_id}:prefs")
+    }
+
+    /// Cache key for notification preferences: `vault:{vault_id}:notification_preferences`.
+    pub fn vault_notif_prefs(vault_id: &str) -> String {
+        format!("vault:{vault_id}:notification_preferences")
+    }
+
+    /// Cache key for vault shares: `vault:{vault_id}:shares`.
+    pub fn vault_shares(vault_id: &str) -> String {
+        format!("vault:{vault_id}:shares")
+    }
+
+    /// Cache key for vault share tokens: `vault:{vault_id}:tokens`.
+    pub fn vault_tokens(vault_id: &str) -> String {
+        format!("vault:{vault_id}:tokens")
+    }
+
+    /// Cache key for vault detail analytics: `vault:{vault_id}:analytics`.
+    pub fn vault_analytics(vault_id: &str) -> String {
+        format!("vault:{vault_id}:analytics")
+    }
+
+    /// Prefix for all query cache entries of a specific vault: `vault:{vault_id}:`.
+    pub fn vault_prefix(vault_id: &str) -> String {
+        format!("vault:{vault_id}:")
+    }
+
+    /// Cache key for vault notification subscription: `subscription:{vault_id}`.
+    pub fn subscription(vault_id: &str) -> String {
+        format!("subscription:{vault_id}")
+    }
+
+    /// Prefix for tenant query cache entries: `tenant:{tenant_id}:`.
+    pub fn tenant_prefix(tenant_id: &str) -> String {
+        format!("tenant:{tenant_id}:")
+    }
+
+    /// Cache key for a share token: `token:{token}`.
+    pub fn token(token: &str) -> String {
+        format!("token:{token}")
+    }
+}
 
 // ── CachedResult ──────────────────────────────────────────────────────────────
 
@@ -57,7 +119,7 @@ pub struct CacheStats {
 
 // ── QueryCache ────────────────────────────────────────────────────────────────
 
-/// Thread-safe in-memory query result cache with TTL support.
+/// Thread-safe in-memory query result cache with TTL support and domain invalidation.
 ///
 /// # Example
 /// ```rust,ignore
@@ -93,7 +155,7 @@ impl QueryCache {
     /// Look up `key` in the cache.
     ///
     /// Returns `Some(value)` on a live hit, `None` on a miss or if the entry
-    /// has expired.  Expired entries are removed lazily on access.
+    /// has expired. Expired entries are removed lazily on access.
     pub fn get(&self, key: &str) -> Option<Value> {
         let mut map = self.inner.lock().unwrap();
         match map.get(key) {
@@ -146,6 +208,51 @@ impl QueryCache {
     /// Remove every entry from the cache.
     pub fn invalidate_all(&self) {
         self.inner.lock().unwrap().clear();
+    }
+
+    // ── Domain-specific invalidation helpers ───────────────────────────────────
+
+    /// Invalidate all query cache entries associated with a specific vault
+    /// (summaries, TTL, preferences, shares, tokens, analytics, and subscriptions).
+    pub fn invalidate_vault(&self, vault_id: &str) {
+        self.invalidate_prefix(&QueryCacheKey::vault_prefix(vault_id));
+        self.invalidate(&QueryCacheKey::subscription(vault_id));
+    }
+
+    /// Invalidate share and token query caches for a vault.
+    pub fn invalidate_shares(&self, vault_id: &str) {
+        self.invalidate(&QueryCacheKey::vault_shares(vault_id));
+        self.invalidate(&QueryCacheKey::vault_tokens(vault_id));
+        self.invalidate(&QueryCacheKey::vault_summary(vault_id));
+        self.invalidate(&QueryCacheKey::vault_analytics(vault_id));
+    }
+
+    /// Invalidate a specific share token and its vault tokens list.
+    pub fn invalidate_share_token(&self, vault_id: &str, token: &str) {
+        self.invalidate(&QueryCacheKey::vault_tokens(vault_id));
+        self.invalidate(&QueryCacheKey::token(token));
+    }
+
+    /// Invalidate notification and reminder preferences for a vault.
+    pub fn invalidate_preferences(&self, vault_id: &str) {
+        self.invalidate(&QueryCacheKey::vault_prefs(vault_id));
+        self.invalidate(&QueryCacheKey::vault_notif_prefs(vault_id));
+    }
+
+    /// Invalidate subscription query caches for a vault.
+    pub fn invalidate_subscription(&self, vault_id: &str) {
+        self.invalidate(&QueryCacheKey::subscription(vault_id));
+        self.invalidate(&QueryCacheKey::vault_summary(vault_id));
+    }
+
+    /// Invalidate tenant query caches.
+    pub fn invalidate_tenant(&self, tenant_id: &str) {
+        self.invalidate_prefix(&QueryCacheKey::tenant_prefix(tenant_id));
+    }
+
+    /// Invalidate credential update caches for a vault.
+    pub fn invalidate_credential(&self, vault_id: &str) {
+        self.invalidate_prefix(&QueryCacheKey::vault_prefix(vault_id));
     }
 
     /// Return a point-in-time snapshot of cache statistics.
@@ -242,5 +349,55 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.total_entries, 2);
         assert_eq!(stats.expired_entries, 2);
+    }
+
+    #[test]
+    fn test_domain_invalidate_vault() {
+        let cache = QueryCache::new();
+        cache.set(&QueryCacheKey::vault_summary("v1"), json!({"id": "v1"}));
+        cache.set(&QueryCacheKey::vault_ttl("v1"), json!(3600));
+        cache.set(&QueryCacheKey::vault_prefs("v1"), json!({"freq": "Daily"}));
+        cache.set(&QueryCacheKey::subscription("v1"), json!({"active": true}));
+        cache.set(&QueryCacheKey::vault_summary("v2"), json!({"id": "v2"}));
+
+        cache.invalidate_vault("v1");
+
+        assert!(cache.get(&QueryCacheKey::vault_summary("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::vault_ttl("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::vault_prefs("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::subscription("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::vault_summary("v2")).is_some());
+    }
+
+    #[test]
+    fn test_domain_invalidate_shares_and_tokens() {
+        let cache = QueryCache::new();
+        cache.set(&QueryCacheKey::vault_shares("v1"), json!(["user1"]));
+        cache.set(&QueryCacheKey::vault_tokens("v1"), json!(["tok-1"]));
+        cache.set(&QueryCacheKey::token("tok-1"), json!({"token": "tok-1"}));
+
+        cache.invalidate_share_token("v1", "tok-1");
+        assert!(cache.get(&QueryCacheKey::vault_tokens("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::token("tok-1")).is_none());
+        assert!(cache.get(&QueryCacheKey::vault_shares("v1")).is_some());
+
+        cache.invalidate_shares("v1");
+        assert!(cache.get(&QueryCacheKey::vault_shares("v1")).is_none());
+    }
+
+    #[test]
+    fn test_domain_invalidate_preferences_and_subscription() {
+        let cache = QueryCache::new();
+        cache.set(&QueryCacheKey::vault_prefs("v1"), json!({"hours": 24}));
+        cache.set(&QueryCacheKey::vault_notif_prefs("v1"), json!({"email": true}));
+        cache.set(&QueryCacheKey::subscription("v1"), json!({"freq": "Daily"}));
+
+        cache.invalidate_preferences("v1");
+        assert!(cache.get(&QueryCacheKey::vault_prefs("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::vault_notif_prefs("v1")).is_none());
+        assert!(cache.get(&QueryCacheKey::subscription("v1")).is_some());
+
+        cache.invalidate_subscription("v1");
+        assert!(cache.get(&QueryCacheKey::subscription("v1")).is_none());
     }
 }

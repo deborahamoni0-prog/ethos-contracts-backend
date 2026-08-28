@@ -1,9 +1,8 @@
-// Glob imports: this file's #[cfg(test)] mod tests (use super::*) draws on most
-// of db's and models' public API, so an explicit list would just duplicate it.
 #[allow(clippy::wildcard_imports)]
 use crate::db::*;
 #[allow(clippy::wildcard_imports)]
 use crate::models::*;
+use crate::query_cache::{QueryCache, QueryCacheKey};
 use chrono::{DateTime, Utc};
 
 pub fn search_vaults_handler(store: &VaultStore, query: SearchQuery) -> SearchResult {
@@ -412,6 +411,20 @@ pub fn restore_vault_handler(
     Ok(vault)
 }
 
+/// POST /vaults/restore with query cache invalidation.
+pub fn restore_vault_with_cache_handler(
+    store: &VaultStore,
+    backup_store: &BackupStore,
+    request: &RestoreRequest,
+    query_cache: Option<&QueryCache>,
+) -> Result<Vault, String> {
+    let vault = restore_vault_handler(store, backup_store, request)?;
+    if let Some(cache) = query_cache {
+        cache.invalidate_vault(&vault.id);
+    }
+    Ok(vault)
+}
+
 fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -517,6 +530,23 @@ pub fn share_vault_handler(
     Ok(share)
 }
 
+/// POST /vaults/{id}/share with query cache invalidation.
+pub fn share_vault_with_cache_handler(
+    store: &VaultStore,
+    share_store: &ShareStore,
+    token_store: &ShareTokenStore,
+    audit_store: &AuditStore,
+    vault_id: &str,
+    request: ShareRequest,
+    query_cache: Option<&QueryCache>,
+) -> Result<VaultShare, String> {
+    let share = share_vault_handler(store, share_store, token_store, audit_store, vault_id, request)?;
+    if let Some(cache) = query_cache {
+        cache.invalidate_shares(vault_id);
+    }
+    Ok(share)
+}
+
 /// POST /vaults/{id}/share/tokens
 pub fn generate_share_token_handler(
     store: &VaultStore,
@@ -587,6 +617,23 @@ pub fn generate_share_token_handler(
     })
 }
 
+/// POST /vaults/{id}/share/tokens with query cache invalidation.
+pub fn generate_share_token_with_cache_handler(
+    store: &VaultStore,
+    share_store: &ShareStore,
+    token_store: &ShareTokenStore,
+    audit_store: &AuditStore,
+    vault_id: &str,
+    request: GenerateTokenRequest,
+    query_cache: Option<&QueryCache>,
+) -> Result<ShareTokenResponse, String> {
+    let res = generate_share_token_handler(store, share_store, token_store, audit_store, vault_id, request)?;
+    if let Some(cache) = query_cache {
+        cache.invalidate_shares(vault_id);
+    }
+    Ok(res)
+}
+
 /// POST /vaults/{id}/share/tokens/revoke
 pub fn revoke_share_token_handler(
     store: &VaultStore,
@@ -620,6 +667,22 @@ pub fn revoke_share_token_handler(
         }),
     );
 
+    Ok(token)
+}
+
+/// POST /vaults/{id}/share/tokens/revoke with query cache invalidation.
+pub fn revoke_share_token_with_cache_handler(
+    store: &VaultStore,
+    token_store: &ShareTokenStore,
+    audit_store: &AuditStore,
+    vault_id: &str,
+    request: RevokeTokenRequest,
+    query_cache: Option<&QueryCache>,
+) -> Result<ShareToken, String> {
+    let token = revoke_share_token_handler(store, token_store, audit_store, vault_id, request)?;
+    if let Some(cache) = query_cache {
+        cache.invalidate_share_token(vault_id, &token.token);
+    }
     Ok(token)
 }
 
@@ -773,6 +836,21 @@ pub fn set_notification_preferences_handler(
     };
 
     set_notification_preferences(notif_store, prefs.clone());
+    Ok(prefs)
+}
+
+/// POST /vaults/{id}/notification-preferences with query cache invalidation.
+pub fn set_notification_preferences_with_cache_handler(
+    store: &VaultStore,
+    notif_store: &NotificationStore,
+    vault_id: &str,
+    request: NotificationPreferencesRequest,
+    query_cache: Option<&QueryCache>,
+) -> Result<VaultNotificationPreferences, String> {
+    let prefs = set_notification_preferences_handler(store, notif_store, vault_id, request)?;
+    if let Some(cache) = query_cache {
+        cache.invalidate_preferences(vault_id);
+    }
     Ok(prefs)
 }
 
@@ -2162,5 +2240,267 @@ mod tests {
             (analytics.withdrawal_trends.average_withdrawal_amount - 2000.0).abs() < f64::EPSILON
         );
         assert!(analytics.withdrawal_trends.last_withdrawal_date.is_some());
+    }
+
+    // ── Task #359: Query Cache Invalidation on Write Tests ────────────────────
+
+    #[test]
+    fn test_restore_vault_invalidates_query_cache() {
+        let store = create_vault_store();
+        let backup_store = create_backup_store();
+        let query_cache = QueryCache::new();
+
+        let vault = Vault {
+            id: "v1".to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "ben1".to_string(),
+            balance: 1000,
+            check_in_interval: 86400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(86400),
+        };
+        store.lock().unwrap().insert("v1".to_string(), vault);
+
+        // Create backup
+        let backup = backup_vault_handler(&store, &backup_store, "v1").unwrap();
+
+        // Populate query cache
+        query_cache.set(&QueryCacheKey::vault_summary("v1"), serde_json::json!({"balance": 1000}));
+        query_cache.set(&QueryCacheKey::vault_ttl("v1"), serde_json::json!(86400));
+        assert!(query_cache.get(&QueryCacheKey::vault_summary("v1")).is_some());
+
+        // Restore vault with cache invalidation
+        let req = RestoreRequest {
+            backup_id: backup.backup_id,
+            encryption_key: "dummy-key".to_string(),
+        };
+        let restored = restore_vault_with_cache_handler(&store, &backup_store, &req, Some(&query_cache)).unwrap();
+        assert_eq!(restored.id, "v1");
+
+        // Cached queries for v1 should be invalidated
+        assert!(query_cache.get(&QueryCacheKey::vault_summary("v1")).is_none());
+        assert!(query_cache.get(&QueryCacheKey::vault_ttl("v1")).is_none());
+    }
+
+    #[test]
+    fn test_share_vault_and_tokens_invalidates_query_cache() {
+        let store = create_vault_store();
+        let share_store = create_share_store();
+        let token_store = create_share_token_store();
+        let audit_store = create_audit_store();
+        let query_cache = QueryCache::new();
+
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            Vault {
+                id: "v1".to_string(),
+                owner: "owner1".to_string(),
+                beneficiary: "ben1".to_string(),
+                balance: 100,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: Some(86400),
+            },
+        );
+
+        // Pre-populate query cache
+        query_cache.set(&QueryCacheKey::vault_shares("v1"), serde_json::json!([]));
+        query_cache.set(&QueryCacheKey::vault_tokens("v1"), serde_json::json!([]));
+
+        // Generate token with cache invalidation
+        let token_res = generate_share_token_with_cache_handler(
+            &store,
+            &share_store,
+            &token_store,
+            &audit_store,
+            "v1",
+            GenerateTokenRequest {
+                shared_with: "user@example.com".to_string(),
+                permission: Some(SharePermission::ViewOnly),
+                expiry_seconds: Some(3600),
+            },
+            Some(&query_cache),
+        )
+        .unwrap();
+
+        // Query cache for shares/tokens should be invalidated
+        assert!(query_cache.get(&QueryCacheKey::vault_shares("v1")).is_none());
+        assert!(query_cache.get(&QueryCacheKey::vault_tokens("v1")).is_none());
+
+        // Cache the specific token entry
+        query_cache.set(&QueryCacheKey::token(&token_res.token.token), serde_json::json!({"revoked": false}));
+        assert!(query_cache.get(&QueryCacheKey::token(&token_res.token.token)).is_some());
+
+        // Revoke token with cache invalidation
+        let revoked = revoke_share_token_with_cache_handler(
+            &store,
+            &token_store,
+            &audit_store,
+            "v1",
+            RevokeTokenRequest {
+                token: token_res.token.token.clone(),
+            },
+            Some(&query_cache),
+        )
+        .unwrap();
+        assert!(revoked.revoked);
+
+        // Cache for the token should be invalidated
+        assert!(query_cache.get(&QueryCacheKey::token(&token_res.token.token)).is_none());
+    }
+
+    #[test]
+    fn test_set_notification_preferences_invalidates_query_cache() {
+        let store = create_vault_store();
+        let notif_store = create_notification_store();
+        let query_cache = QueryCache::new();
+
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            Vault {
+                id: "v1".to_string(),
+                owner: "owner1".to_string(),
+                beneficiary: "ben1".to_string(),
+                balance: 100,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: Some(86400),
+            },
+        );
+
+        // Pre-populate query cache
+        query_cache.set(&QueryCacheKey::vault_prefs("v1"), serde_json::json!({"email": false}));
+        query_cache.set(&QueryCacheKey::vault_notif_prefs("v1"), serde_json::json!({"email": false}));
+
+        let req = NotificationPreferencesRequest {
+            channels: vec![NotificationChannel::Email, NotificationChannel::Sms],
+            frequency: NotificationFrequency::Daily,
+        };
+        let _prefs = set_notification_preferences_with_cache_handler(
+            &store,
+            &notif_store,
+            "v1",
+            req,
+            Some(&query_cache),
+        )
+        .unwrap();
+
+        assert!(query_cache.get(&QueryCacheKey::vault_prefs("v1")).is_none());
+        assert!(query_cache.get(&QueryCacheKey::vault_notif_prefs("v1")).is_none());
+    }
+
+    #[test]
+    fn test_write_then_read_consistency_through_query_cache() {
+        let store = create_vault_store();
+        let backup_store = create_backup_store();
+        let query_cache = QueryCache::new();
+
+        let initial_vault = Vault {
+            id: "v1".to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "ben1".to_string(),
+            balance: 500,
+            check_in_interval: 86400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(86400),
+        };
+        store.lock().unwrap().insert("v1".to_string(), initial_vault.clone());
+
+        // Cache initial read
+        query_cache.set(&QueryCacheKey::vault_summary("v1"), serde_json::json!({"balance": 500}));
+        assert_eq!(
+            query_cache.get(&QueryCacheKey::vault_summary("v1")).unwrap()["balance"],
+            500
+        );
+
+        // Update vault state by modifying and backing up a new state
+        let updated_vault = Vault {
+            balance: 1500,
+            ..initial_vault
+        };
+        store.lock().unwrap().insert("v1".to_string(), updated_vault);
+        let backup = backup_vault_handler(&store, &backup_store, "v1").unwrap();
+
+        // Restore with cache invalidation
+        restore_vault_with_cache_handler(
+            &store,
+            &backup_store,
+            &RestoreRequest {
+                backup_id: backup.backup_id,
+                encryption_key: "dummy-key".to_string(),
+            },
+            Some(&query_cache),
+        )
+        .unwrap();
+
+        // Cache lookup is a miss (invalidated on write)
+        assert!(query_cache.get(&QueryCacheKey::vault_summary("v1")).is_none());
+
+        // Subsequent read queries store and repopulates fresh cache value
+        let current_vault = store.lock().unwrap().get("v1").cloned().unwrap();
+        query_cache.set(
+            &QueryCacheKey::vault_summary("v1"),
+            serde_json::json!({"balance": current_vault.balance}),
+        );
+        assert_eq!(
+            query_cache.get(&QueryCacheKey::vault_summary("v1")).unwrap()["balance"],
+            1500
+        );
+    }
+
+    #[test]
+    fn test_regression_previously_missed_invalidation_path_on_restore_and_revoke() {
+        let store = create_vault_store();
+        let backup_store = create_backup_store();
+        let query_cache = QueryCache::new();
+
+        store.lock().unwrap().insert(
+            "v-regression".to_string(),
+            Vault {
+                id: "v-regression".to_string(),
+                owner: "owner".to_string(),
+                beneficiary: "ben".to_string(),
+                balance: 100,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: Some(86400),
+            },
+        );
+
+        let backup = backup_vault_handler(&store, &backup_store, "v-regression").unwrap();
+
+        // Populate multiple query cache keys for this vault
+        query_cache.set("vault:v-regression:summary", serde_json::json!({"balance": 100}));
+        query_cache.set("vault:v-regression:ttl", serde_json::json!(86400));
+        query_cache.set("vault:v-regression:shares", serde_json::json!([]));
+        query_cache.set("subscription:v-regression", serde_json::json!({"active": true}));
+
+        // Execute restore with cache invalidation
+        restore_vault_with_cache_handler(
+            &store,
+            &backup_store,
+            &RestoreRequest {
+                backup_id: backup.backup_id,
+                encryption_key: "dummy-key".to_string(),
+            },
+            Some(&query_cache),
+        )
+        .unwrap();
+
+        // Verify ALL keys for this vault were purged, preventing stale reads
+        assert!(query_cache.get("vault:v-regression:summary").is_none());
+        assert!(query_cache.get("vault:v-regression:ttl").is_none());
+        assert!(query_cache.get("vault:v-regression:shares").is_none());
+        assert!(query_cache.get("subscription:v-regression").is_none());
     }
 }

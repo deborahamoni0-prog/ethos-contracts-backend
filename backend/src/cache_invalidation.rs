@@ -1,13 +1,14 @@
-/// Event-driven cache invalidation with dependency tracking.
+/// Event-driven cache invalidation with dependency tracking and query cache integration.
 ///
 /// Provides automatic, reliable cache invalidation triggered by domain events
 /// (check-ins, deposits, withdrawals, etc.). Tracks cache dependencies and
-/// implements cascade invalidation to maintain consistency.
+/// implements cascade invalidation across VaultCache and QueryCache to maintain consistency.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::cache::VaultCache;
+use crate::query_cache::QueryCache;
 
 // ── Event Types ───────────────────────────────────────────────────────────────
 
@@ -58,7 +59,7 @@ struct DependencyGraph {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum CacheKey {
+pub enum CacheKey {
     Vault,
     TtlRemaining,
     Summary,
@@ -163,6 +164,7 @@ impl InvalidationStrategy {
 
 pub struct CacheInvalidator {
     cache: Arc<VaultCache>,
+    query_cache: Option<Arc<QueryCache>>,
     dependency_graph: Arc<Mutex<DependencyGraph>>,
     stats: Arc<Mutex<InvalidationStats>>,
 }
@@ -179,12 +181,24 @@ impl CacheInvalidator {
     pub fn new(cache: Arc<VaultCache>) -> Self {
         Self {
             cache,
+            query_cache: None,
             dependency_graph: Arc::new(Mutex::new(DependencyGraph::new())),
             stats: Arc::new(Mutex::new(InvalidationStats::default())),
         }
     }
 
-    /// Process a cache event and invalidate affected entries.
+    /// Attach a [`QueryCache`] to invalidate cached query results alongside the vault cache.
+    pub fn with_query_cache(mut self, query_cache: Arc<QueryCache>) -> Self {
+        self.query_cache = Some(query_cache);
+        self
+    }
+
+    /// Set or update the query cache instance.
+    pub fn set_query_cache(&mut self, query_cache: Arc<QueryCache>) {
+        self.query_cache = Some(query_cache);
+    }
+
+    /// Process a cache event and invalidate affected entries across both cache layers.
     pub fn handle_event(&self, event: CacheEvent) {
         let mut stats = self.stats.lock().unwrap();
         stats.total_events += 1;
@@ -192,6 +206,9 @@ impl CacheInvalidator {
         match &event {
             CacheEvent::GlobalFlush => {
                 self.cache.invalidate_all();
+                if let Some(ref qc) = self.query_cache {
+                    qc.invalidate_all();
+                }
                 self.dependency_graph.lock().unwrap().clear_all();
                 stats.global_flushes += 1;
                 stats.total_invalidations += 1;
@@ -199,11 +216,26 @@ impl CacheInvalidator {
             _ => {
                 if let Some(vault_id) = event.vault_id() {
                     // Get keys to invalidate based on event type.
-                    let keys = InvalidationStrategy::keys_to_invalidate(&event);
+                    let _keys = InvalidationStrategy::keys_to_invalidate(&event);
 
                     // Invalidate the primary vault entry.
                     self.cache.invalidate(vault_id);
                     stats.total_invalidations += 1;
+
+                    // Invalidate corresponding query cache keys if configured.
+                    if let Some(ref qc) = self.query_cache {
+                        match &event {
+                            CacheEvent::ReminderPreferencesUpdated { .. } => {
+                                qc.invalidate_preferences(vault_id);
+                            }
+                            CacheEvent::SubscriptionChanged { .. } => {
+                                qc.invalidate_subscription(vault_id);
+                            }
+                            _ => {
+                                qc.invalidate_vault(vault_id);
+                            }
+                        }
+                    }
 
                     // Check for cascade dependencies.
                     let dependents = self
@@ -313,6 +345,7 @@ mod tests {
     use super::*;
     use crate::models::{Vault, VaultStatus};
     use chrono::Utc;
+    use serde_json::json;
 
     fn make_test_vault(id: &str) -> Vault {
         Vault {
@@ -397,11 +430,16 @@ mod tests {
     #[test]
     fn test_cache_invalidator_handles_vault_state_change() {
         let cache = Arc::new(VaultCache::new());
-        let invalidator = CacheInvalidator::new(Arc::clone(&cache));
+        let query_cache = Arc::new(QueryCache::new());
+        query_cache.set("vault:v1:summary", json!({"id": "v1"}));
+
+        let invalidator = CacheInvalidator::new(Arc::clone(&cache))
+            .with_query_cache(Arc::clone(&query_cache));
 
         // Populate cache.
         cache.set_vault("v1", make_test_vault("v1"));
         assert!(cache.get_vault("v1").is_some());
+        assert!(query_cache.get("vault:v1:summary").is_some());
 
         // Trigger invalidation.
         invalidator.handle_event(CacheEvent::VaultStateChanged {
@@ -410,6 +448,7 @@ mod tests {
 
         // Cache should be cleared.
         assert!(cache.get_vault("v1").is_none());
+        assert!(query_cache.get("vault:v1:summary").is_none());
 
         let stats = invalidator.get_stats();
         assert_eq!(stats.total_events, 1);
@@ -419,7 +458,11 @@ mod tests {
     #[test]
     fn test_cache_invalidator_handles_global_flush() {
         let cache = Arc::new(VaultCache::new());
-        let invalidator = CacheInvalidator::new(Arc::clone(&cache));
+        let query_cache = Arc::new(QueryCache::new());
+        query_cache.set("vault:v1:summary", json!({"id": "v1"}));
+
+        let invalidator = CacheInvalidator::new(Arc::clone(&cache))
+            .with_query_cache(Arc::clone(&query_cache));
 
         cache.set_vault("v1", make_test_vault("v1"));
         cache.set_vault("v2", make_test_vault("v2"));
@@ -428,6 +471,7 @@ mod tests {
 
         assert!(cache.get_vault("v1").is_none());
         assert!(cache.get_vault("v2").is_none());
+        assert!(query_cache.get("vault:v1:summary").is_none());
 
         let stats = invalidator.get_stats();
         assert_eq!(stats.global_flushes, 1);

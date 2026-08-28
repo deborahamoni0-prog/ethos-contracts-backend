@@ -51,6 +51,8 @@ pub async fn delete_preferences(
     Path(vault_id): Path<u64>,
 ) -> Result<StatusCode, AppError> {
     state.db.soft_delete_reminder(vault_id)?;
+    state.query_cache.invalidate_preferences(&vault_id.to_string());
+    state.query_cache.invalidate_vault(&vault_id.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -87,6 +89,8 @@ pub async fn set_preferences(
         deleted_at: None,
     };
     db.upsert(&prefs)?;
+    state.query_cache.invalidate_preferences(&vault_id.to_string());
+    state.query_cache.invalidate_vault(&vault_id.to_string());
 
     // Store idempotency record if key was provided
     if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
@@ -172,6 +176,8 @@ pub async fn set_subscription(
         frequency: body.frequency,
     };
     state.db.upsert_subscription(&sub)?;
+    state.query_cache.invalidate_subscription(&vault_id.to_string());
+    state.query_cache.invalidate_vault(&vault_id.to_string());
 
     Ok((StatusCode::OK, Json(sub)))
 }
@@ -181,6 +187,8 @@ pub async fn delete_subscription(
     Path(vault_id): Path<u64>,
 ) -> Result<StatusCode, AppError> {
     state.db.delete_subscription(vault_id)?;
+    state.query_cache.invalidate_subscription(&vault_id.to_string());
+    state.query_cache.invalidate_vault(&vault_id.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -217,6 +225,7 @@ pub async fn create_tenant(
         .db
         .create_tenant(&tenant)
         .map_err(|_| AppError::DatabaseError)?;
+    state.query_cache.invalidate_tenant(&tenant.id);
     Ok((StatusCode::CREATED, Json(tenant)))
 }
 
@@ -239,6 +248,8 @@ pub async fn add_vault_to_tenant(
         .db
         .add_vault_to_tenant(&tenant_id, &vault_id)
         .map_err(|_| AppError::DatabaseError)?;
+    state.query_cache.invalidate_tenant(&tenant_id);
+    state.query_cache.invalidate_vault(&vault_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -265,12 +276,13 @@ pub async fn record_credential_update(
     Json(mut update): Json<crate::models::CredentialUpdate>,
 ) -> Result<(StatusCode, Json<crate::models::CredentialUpdate>), AppError> {
     update.id = uuid::Uuid::new_v4().to_string();
-    update.vault_id = vault_id;
+    update.vault_id = vault_id.clone();
     update.timestamp = chrono::Utc::now();
     state
         .db
         .store_credential_update(&update)
         .map_err(|_| AppError::DatabaseError)?;
+    state.query_cache.invalidate_credential(&vault_id);
     Ok((StatusCode::CREATED, Json(update)))
 }
 
@@ -280,12 +292,13 @@ pub async fn apply_operational_transform(
     Json(mut transform): Json<crate::models::OperationalTransform>,
 ) -> Result<(StatusCode, Json<crate::models::OperationalTransform>), AppError> {
     transform.id = uuid::Uuid::new_v4().to_string();
-    transform.vault_id = vault_id;
+    transform.vault_id = vault_id.clone();
     transform.timestamp = chrono::Utc::now();
     state
         .db
         .store_operational_transform(&transform)
         .map_err(|_| AppError::DatabaseError)?;
+    state.query_cache.invalidate_credential(&vault_id);
     Ok((StatusCode::CREATED, Json(transform)))
 }
 
