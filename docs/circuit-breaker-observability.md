@@ -26,6 +26,14 @@ Wrap a fallible call with `breaker.call(|| do_the_thing())`. The breaker
 either runs the closure and records the outcome, or immediately returns
 `CircuitBreakerError::Rejected` without invoking it.
 
+### Half-Open Request Capping (#363)
+
+To prevent a flood of concurrent trial requests from overwhelming recovering downstream dependencies, `CircuitBreakerConfig` includes:
+
+- `half_open_max_requests` (default: 1): Maximum number of concurrent probe requests permitted through the breaker while in the `HalfOpen` state.
+- Excess concurrent requests arriving while active half-open probe slots are saturated are rejected with `CircuitBreakerError::Rejected` and increment `calls_rejected_total`.
+- Once `success_threshold` consecutive successful probes complete, the breaker closes and permits normal traffic. If any probe fails, the breaker transitions immediately back to `Open`.
+
 ## Observability surface
 
 - **State metrics** — `CircuitBreaker::render_metrics()` emits Prometheus

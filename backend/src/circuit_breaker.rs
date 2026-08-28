@@ -63,6 +63,8 @@ pub struct CircuitBreakerConfig {
     pub success_threshold: u32,
     /// How long the breaker stays open before allowing a half-open probe.
     pub open_duration: Duration,
+    /// Maximum concurrent probe requests allowed during half-open state (#363).
+    pub half_open_max_requests: u32,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -71,6 +73,7 @@ impl Default for CircuitBreakerConfig {
             failure_threshold: 5,
             success_threshold: 2,
             open_duration: Duration::from_secs(30),
+            half_open_max_requests: 1,
         }
     }
 }
@@ -118,6 +121,21 @@ pub struct CircuitBreakerSnapshot {
 
 const MAX_EVENT_HISTORY: usize = 200;
 
+/// RAII guard ensuring active half-open request count is decremented on completion (#363).
+struct HalfOpenGuard<'a>(&'a CircuitBreaker);
+
+impl<'a> Drop for HalfOpenGuard<'a> {
+    fn drop(&mut self) {
+        self.0.half_open_active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[allow(dead_code)]
+enum CallPermit<'a> {
+    Closed,
+    HalfOpen(HalfOpenGuard<'a>),
+}
+
 /// A single named circuit breaker with built-in observability.
 pub struct CircuitBreaker {
     name: String,
@@ -130,6 +148,7 @@ pub struct CircuitBreaker {
     failures_total: AtomicU64,
     successes_total: AtomicU64,
     state_transitions_total: AtomicU64,
+    half_open_active: AtomicU64,
     opened_at: Mutex<Option<Instant>>,
     opened_at_wall: Mutex<Option<DateTime<Utc>>>,
     events: Mutex<Vec<StateChangeEvent>>,
@@ -166,6 +185,7 @@ impl CircuitBreaker {
             failures_total: AtomicU64::new(0),
             successes_total: AtomicU64::new(0),
             state_transitions_total: AtomicU64::new(0),
+            half_open_active: AtomicU64::new(0),
             opened_at: Mutex::new(None),
             opened_at_wall: Mutex::new(None),
             events: Mutex::new(Vec::new()),
@@ -185,13 +205,19 @@ impl CircuitBreaker {
         &self,
         f: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, CircuitBreakerError<E>> {
-        if !self.allow_call() {
-            self.calls_rejected_total.fetch_add(1, Ordering::Relaxed);
-            return Err(CircuitBreakerError::Rejected);
-        }
+        let permit = match self.acquire_call_permit() {
+            Some(p) => p,
+            None => {
+                self.calls_rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(CircuitBreakerError::Rejected);
+            }
+        };
 
         self.calls_allowed_total.fetch_add(1, Ordering::Relaxed);
-        match f() {
+        let res = f();
+        drop(permit);
+
+        match res {
             Ok(value) => {
                 self.on_success();
                 Ok(value)
@@ -205,10 +231,13 @@ impl CircuitBreaker {
 
     /// Whether a call would currently be allowed through, transitioning
     /// Open -> HalfOpen if the cool-down window has elapsed.
-    fn allow_call(&self) -> bool {
+    pub fn allow_call(&self) -> bool {
         match self.state() {
             CircuitState::Closed => true,
-            CircuitState::HalfOpen => true,
+            CircuitState::HalfOpen => {
+                let cap = u64::from(self.config.half_open_max_requests.max(1));
+                self.half_open_active.load(Ordering::Acquire) < cap
+            }
             CircuitState::Open => {
                 let elapsed = self
                     .opened_at
@@ -218,10 +247,49 @@ impl CircuitBreaker {
                     .unwrap_or(true);
                 if elapsed {
                     self.transition(CircuitState::HalfOpen, "open_duration elapsed, probing");
-                    true
+                    let cap = u64::from(self.config.half_open_max_requests.max(1));
+                    self.half_open_active.load(Ordering::Acquire) < cap
                 } else {
                     false
                 }
+            }
+        }
+    }
+
+    fn acquire_call_permit(&self) -> Option<CallPermit<'_>> {
+        match self.state() {
+            CircuitState::Closed => Some(CallPermit::Closed),
+            CircuitState::Open => {
+                let elapsed = self
+                    .opened_at
+                    .lock()
+                    .unwrap()
+                    .map(|at| at.elapsed() >= self.config.open_duration)
+                    .unwrap_or(true);
+                if elapsed {
+                    self.transition(CircuitState::HalfOpen, "open_duration elapsed, probing");
+                    self.try_acquire_half_open_permit()
+                } else {
+                    None
+                }
+            }
+            CircuitState::HalfOpen => self.try_acquire_half_open_permit(),
+        }
+    }
+
+    fn try_acquire_half_open_permit(&self) -> Option<CallPermit<'_>> {
+        let cap = u64::from(self.config.half_open_max_requests.max(1));
+        loop {
+            let current = self.half_open_active.load(Ordering::Acquire);
+            if current >= cap {
+                return None;
+            }
+            if self
+                .half_open_active
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(CallPermit::HalfOpen(HalfOpenGuard(self)));
             }
         }
     }
@@ -275,11 +343,13 @@ impl CircuitBreaker {
         if to == CircuitState::Open {
             *self.opened_at.lock().unwrap() = Some(Instant::now());
             *self.opened_at_wall.lock().unwrap() = Some(Utc::now());
+            self.half_open_active.store(0, Ordering::Release);
         }
         if to == CircuitState::Closed {
             *self.opened_at.lock().unwrap() = None;
             *self.opened_at_wall.lock().unwrap() = None;
             self.consecutive_failures.store(0, Ordering::Relaxed);
+            self.half_open_active.store(0, Ordering::Release);
         }
 
         let event = StateChangeEvent {
@@ -567,6 +637,7 @@ mod tests {
             failure_threshold: 1,
             success_threshold: 2,
             open_duration: Duration::from_millis(0),
+            ..CircuitBreakerConfig::default()
         };
         let cb = CircuitBreaker::new("test", cfg);
         let _ = cb.call(err_call);
@@ -585,6 +656,7 @@ mod tests {
             failure_threshold: 1,
             success_threshold: 2,
             open_duration: Duration::from_millis(0),
+            ..CircuitBreakerConfig::default()
         };
         let cb = CircuitBreaker::new("test", cfg);
         let _ = cb.call(err_call);
@@ -645,5 +717,113 @@ mod tests {
         assert!(diagram.contains("Closed --> Open"));
         assert!(diagram.contains("Open --> HalfOpen"));
         assert!(diagram.contains("HalfOpen --> Closed"));
+    }
+
+    #[test]
+    fn half_open_request_capping_rejects_excess_concurrent_requests() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            open_duration: Duration::from_millis(0),
+            half_open_max_requests: 1,
+        };
+        let cb = Arc::new(CircuitBreaker::new("test-capping", cfg));
+
+        // Trip open
+        let _ = cb.call(err_call);
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // Spawn thread 1 holding the single half-open probe slot
+        let cb_clone = Arc::clone(&cb);
+        let t1 = thread::spawn(move || {
+            cb_clone.call(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<(), &'static str>(())
+            })
+        });
+
+        // Wait for thread 1 to enter the probe
+        entered_rx.recv().unwrap();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Thread 2 attempts a call during half-open while thread 1 holds the slot -> rejected!
+        let t2_res = cb.call(ok_call);
+        match t2_res {
+            Err(CircuitBreakerError::Rejected) => {}
+            other => panic!("expected half-open excess request to be rejected, got {other:?}"),
+        }
+        assert_eq!(cb.snapshot().calls_rejected_total, 1); // 1 half-open cap rejection
+
+        // Release thread 1
+        release_tx.send(()).unwrap();
+        assert!(t1.join().unwrap().is_ok());
+
+        // Now that thread 1 finished, a second probe is permitted and closes the breaker
+        assert!(cb.call(ok_call).is_ok());
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn half_open_capping_with_higher_concurrency_limit() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 3,
+            open_duration: Duration::from_millis(0),
+            half_open_max_requests: 2,
+        };
+        let cb = Arc::new(CircuitBreaker::new("test-capping-2", cfg));
+        let _ = cb.call(err_call);
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let (t1_in, t1_wait) = (mpsc::channel(), mpsc::channel());
+        let (t2_in, t2_wait) = (mpsc::channel(), mpsc::channel());
+
+        let cb1 = Arc::clone(&cb);
+        let t1_in_tx = t1_in.0;
+        let t1_wait_rx = t1_wait.1;
+        let h1 = thread::spawn(move || {
+            cb1.call(|| {
+                t1_in_tx.send(()).unwrap();
+                t1_wait_rx.recv().unwrap();
+                Ok::<(), &'static str>(())
+            })
+        });
+
+        let cb2 = Arc::clone(&cb);
+        let t2_in_tx = t2_in.0;
+        let t2_wait_rx = t2_wait.1;
+        let h2 = thread::spawn(move || {
+            cb2.call(|| {
+                t2_in_tx.send(()).unwrap();
+                t2_wait_rx.recv().unwrap();
+                Ok::<(), &'static str>(())
+            })
+        });
+
+        t1_in.1.recv().unwrap();
+        t2_in.1.recv().unwrap();
+
+        // 2 active in half-open matches half_open_max_requests=2. 3rd request should be rejected.
+        assert!(matches!(cb.call(ok_call), Err(CircuitBreakerError::Rejected)));
+
+        // Release h1 and h2
+        t1_wait.0.send(()).unwrap();
+        t2_wait.0.send(()).unwrap();
+        assert!(h1.join().unwrap().is_ok());
+        assert!(h2.join().unwrap().is_ok());
+
+        // 3rd success closes the breaker
+        assert!(cb.call(ok_call).is_ok());
+        assert_eq!(cb.state(), CircuitState::Closed);
     }
 }
