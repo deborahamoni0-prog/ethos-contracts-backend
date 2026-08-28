@@ -255,3 +255,57 @@ fn test_revoked_is_terminal() {
         credential_lifecycle::CredentialState::Revoked
     );
 }
+
+/// Test that a revoked credential cannot be revived by re-initializing it
+#[test]
+fn test_revoked_credential_cannot_be_reinitialized() {
+    let (_env, admin, _user, client) = setup_credential_tests();
+    let credential_id = 6u64;
+
+    // Initialize, activate, and revoke
+    client.init_credential(&credential_id);
+    let _ = client.activate_credential(&admin, &credential_id);
+    let _ = client.revoke_credential(&admin, &credential_id);
+
+    // Attempt to re-initialize (would reset state to Draft) — must be a no-op
+    client.init_credential(&credential_id);
+    assert_eq!(
+        client.get_credential_state(&credential_id),
+        credential_lifecycle::CredentialState::Revoked,
+        "re-initialization must not revive a revoked credential"
+    );
+
+    // Activating must still fail
+    let err = client
+        .try_activate_credential(&admin, &credential_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::InvalidStateTransition);
+}
+
+/// Test that an archived credential cannot be revived by re-initializing it
+#[test]
+fn test_archived_credential_cannot_be_reinitialized() {
+    let (_env, admin, _user, client) = setup_credential_tests();
+    let credential_id = 7u64;
+
+    // Initialize, activate, and archive
+    client.init_credential(&credential_id);
+    let _ = client.activate_credential(&admin, &credential_id);
+    let _ = client.archive_credential(&admin, &credential_id);
+
+    // Attempt to re-initialize — must be a no-op
+    client.init_credential(&credential_id);
+    assert_eq!(
+        client.get_credential_state(&credential_id),
+        credential_lifecycle::CredentialState::Archived,
+        "re-initialization must not revive an archived credential"
+    );
+
+    // Activating must still fail
+    let err = client
+        .try_activate_credential(&admin, &credential_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::InvalidStateTransition);
+}
