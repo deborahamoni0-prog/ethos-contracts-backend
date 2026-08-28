@@ -107,6 +107,7 @@ pub enum DataKey {
     Metadata(u64),
     MintedAt(u64),
     Composition(u64),
+    CompositionComponents(u64),
     SharedMetadata(u64),
     Delegation(u64),
     DelegationHistory(u64),
@@ -138,6 +139,13 @@ pub struct CompositionRecord {
     pub nft_address: Address,
     pub nft_id: u64,
     pub composed_at: u64,
+}
+
+/// Bounded local component references used when resolving composed ownership.
+#[contracttype]
+#[derive(Clone)]
+pub struct CompositionComponents {
+    pub component_ids: Vec<u64>,
 }
 
 #[contracttype]
@@ -648,6 +656,37 @@ impl SbtContract {
         env.storage().instance().get(&DataKey::Composition(sbt_id))
     }
 
+    /// Sets bounded local SBT components for an existing composition.
+    /// Components are validated as a graph before storage is updated.
+    pub fn set_composition_components(env: Env, sbt_id: u64, component_ids: Vec<u64>) {
+        Self::require_owner(&env, sbt_id);
+        if component_ids.is_empty() || Self::composition_reaches_any(&env, &component_ids, sbt_id) {
+            panic_with_error!(&env, SbtError::InvalidCompositionGraph);
+        }
+        for component_id in component_ids.iter() {
+            Self::load_owner(&env, *component_id);
+        }
+        env.storage().instance().set(
+            &DataKey::CompositionComponents(sbt_id),
+            &CompositionComponents { component_ids },
+        );
+    }
+
+    pub fn get_composition_components(env: Env, sbt_id: u64) -> Option<Vec<u64>> {
+        env.storage()
+            .instance()
+            .get::<DataKey, CompositionComponents>(&DataKey::CompositionComponents(sbt_id))
+            .map(|components| components.component_ids)
+    }
+
+    /// Resolves all reachable local components with a hard depth and cycle bound.
+    pub fn resolve_composition(env: Env, sbt_id: u64) -> Vec<u64> {
+        let mut visited = Map::new(&env);
+        let mut resolved = Vec::new(&env);
+        Self::resolve_composition_inner(&env, sbt_id, 0, &mut visited, &mut resolved);
+        resolved
+    }
+
     /// Sets metadata shared across the SBT and any NFT it is composed with.
     /// Owner only.
     pub fn set_shared_metadata(env: Env, sbt_id: u64, metadata: String) {
@@ -965,6 +1004,58 @@ impl SbtContract {
         let mut buffer = [0u8; MAX_METADATA_SIZE as usize];
         metadata.copy_into_slice(&mut buffer[..length]);
         String::from_bytes(env, &buffer[..length])
+    }
+
+    fn composition_reaches_any(env: &Env, roots: &Vec<u64>, target: u64) -> bool {
+        let mut visited = Map::new(env);
+        let mut pending = Vec::new(env);
+        for root in roots.iter() {
+            pending.push_back(*root);
+        }
+        let mut steps = 0u32;
+        while let Some(current) = pending.pop_back() {
+            if current == target {
+                return true;
+            }
+            if visited.contains_key(current) {
+                continue;
+            }
+            visited.set(current, true);
+            steps += 1;
+            if steps > MAX_COMPOSITION_DEPTH {
+                return true;
+            }
+            if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+                &DataKey::CompositionComponents(current),
+            ) {
+                for component in components.component_ids.iter() {
+                    pending.push_back(*component);
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_composition_inner(
+        env: &Env,
+        current: u64,
+        depth: u32,
+        visited: &mut Map<u64, bool>,
+        resolved: &mut Vec<u64>,
+    ) {
+        if depth >= MAX_COMPOSITION_DEPTH || visited.contains_key(current) {
+            panic_with_error!(env, SbtError::InvalidCompositionGraph);
+        }
+        visited.set(current, true);
+        if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+            &DataKey::CompositionComponents(current),
+        ) {
+            for component in components.component_ids.iter() {
+                Self::load_owner(env, *component);
+                resolved.push_back(*component);
+                Self::resolve_composition_inner(env, *component, depth + 1, visited, resolved);
+            }
+        }
     }
 
     fn load_owner(env: &Env, sbt_id: u64) -> Address {
