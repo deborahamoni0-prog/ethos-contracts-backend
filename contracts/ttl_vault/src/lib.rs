@@ -139,6 +139,8 @@ mod regression_tests;
 #[cfg(test)]
 mod slice_failover_tests;
 #[cfg(test)]
+mod slice_consensus_voting_tests;
+#[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
@@ -384,6 +386,8 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 124,
     InheritanceCycleDetected = 125,
+    // Slice consensus voting: finalization attempted below the minimum quorum
+    InsufficientQuorum = 126,
 }
 
 #[contract]
@@ -9570,8 +9574,32 @@ impl TtlVaultContract {
         let timestamp = env.ledger().timestamp();
 
         for i in 0..10 {
-            let _hash_input = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
+            // Include the generation timestamp and index so every issued code is
+            // distinct. Replacing the stored vector below then makes the prior
+            // generation unambiguously invalid, even when codes are regenerated
+            // in the same ledger timestamp.
+            let code_number = vault_id
+                .wrapping_mul(timestamp)
+                .wrapping_add(i as u64);
             let code_str = String::from_str(&env, "code");
+            let mut suffix = String::from_str(&env, "");
+            let mut remaining = code_number;
+            if remaining == 0 {
+                suffix.push_str(&String::from_str(&env, "0"));
+            } else {
+                let mut digits = [0u8; 20];
+                let mut digit_count = 0usize;
+                while remaining > 0 {
+                    digits[digit_count] = b'0' + (remaining % 10) as u8;
+                    digit_count += 1;
+                    remaining /= 10;
+                }
+                while digit_count > 0 {
+                    digit_count -= 1;
+                    suffix.push_str(&String::from_bytes(&env, &Bytes::from_array(&env, &[digits[digit_count]])));
+                }
+            }
+            let code_str = code_str.concat(&suffix);
             codes.push_back(BackupCode {
                 code: code_str.clone(),
                 used: false,
@@ -14902,6 +14930,9 @@ impl TtlVaultContract {
     // ── Issue #269: Credential Lifecycle State Machine ────────────────────────
 
     /// Initialize a credential with Draft state.
+    ///
+    /// No-op if the credential already has a state, so an existing (including
+    /// Revoked/Archived) credential can never be reset back to Draft.
     ///
     /// # Arguments
     /// * `credential_id` - The credential ID to initialize
