@@ -225,7 +225,7 @@ pub struct UpdatePreferencesRequest {
 
 // ── Existing models (unchanged) ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Vault {
     pub id: String,
     pub owner: String,

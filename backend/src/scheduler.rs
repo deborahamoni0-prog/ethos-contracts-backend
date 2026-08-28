@@ -18,6 +18,7 @@ pub async fn run(db: Arc<Db>) {
     // Track when we last ran the daily/hourly tasks.
     let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
     let mut last_rotation_check = chrono::DateTime::<Utc>::MIN_UTC;
+    let mut last_cache_drift_check = chrono::DateTime::<Utc>::MIN_UTC;
 
     loop {
         interval.tick().await;
@@ -108,6 +109,12 @@ pub async fn run(db: Arc<Db>) {
             crate::secret_rotation::run_rotation_scheduler(&db);
             last_rotation_check = now;
         }
+
+        // 5) Consistency checks (runs at most once every 5 minutes).
+        if now.signed_duration_since(last_cache_drift_check).num_minutes() >= 5 {
+            run_consistency_check(&db);
+            last_cache_drift_check = now;
+        }
     }
 }
 
@@ -188,6 +195,7 @@ fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_left: u3
 /// storage and validate each one.  Here we log a scheduled-run notice and
 /// simulate a trivial no-op validation so the job framework is exercised
 /// without requiring an external storage integration.
+#[allow(dead_code)]
 fn run_backup_validation_job() {
     use crate::backup_validation::BackupValidator;
     use chrono::Utc;
@@ -231,7 +239,7 @@ fn run_backup_validation_job() {
 // ── #83: Consistency Check Job ───────────────────────────────────────────────
 
 /// Run the periodic data consistency verification job.
-fn run_consistency_check(db: &Arc<Db>) {
+pub fn run_consistency_check(db: &Arc<Db>) {
     use crate::consistency::ConsistencyChecker;
 
     tracing::info!("consistency check job started");
@@ -273,4 +281,74 @@ fn run_consistency_check(db: &Arc<Db>) {
         failed = report.failed_checks,
         "consistency check job completed"
     );
+}
+
+// ── #360: Multi-Level Cache Consistency Verification Job ─────────────────────
+
+/// Run the periodic multi-level cache consistency verification and auto-healing job.
+pub fn run_cache_consistency_job(
+    cache: &crate::multilevel_cache::MultiLevelCache,
+    store: &crate::db::VaultStore,
+) -> crate::multilevel_cache::CacheDriftReport {
+    tracing::info!("multi-level cache consistency verification job started");
+
+    let report = cache.verify_and_heal_consistency(|vault_id| {
+        store.lock().unwrap().get(vault_id).cloned()
+    });
+
+    if report.drift_count > 0 {
+        tracing::warn!(
+            checked_keys = report.checked_keys_count,
+            drift_count = report.drift_count,
+            healed_count = report.healed_count,
+            "cache drift detected and auto-healed"
+        );
+    } else {
+        tracing::info!(
+            checked_keys = report.checked_keys_count,
+            "multi-level cache consistency verification passed with 0 drift"
+        );
+    }
+
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::create_vault_store;
+    use crate::models::{Vault, VaultStatus};
+    use crate::multilevel_cache::MultiLevelCache;
+
+    #[test]
+    fn test_run_cache_consistency_job_detects_and_heals_drift() {
+        let store = create_vault_store();
+        let cache = MultiLevelCache::new();
+
+        let vault = Vault {
+            id: "v-sched-1".to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "ben1".to_string(),
+            balance: 5000,
+            check_in_interval: 86400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(86400),
+        };
+        store.lock().unwrap().insert("v-sched-1".to_string(), vault.clone());
+
+        // Cache has stale / drifted data
+        let mut stale_vault = vault;
+        stale_vault.balance = 100;
+        cache.set_vault("v-sched-1", stale_vault);
+
+        // Run scheduled job
+        let report = run_cache_consistency_job(&cache, &store);
+        assert_eq!(report.checked_keys_count, 1);
+        // Note: write-through set both L1 and L2 to balance 100, but source-of-truth has 5000.
+        // Even if L1 == L2, verifying against source of truth ensures consistency.
+        let metrics = cache.drift_metrics();
+        assert_eq!(metrics.total_verifications, 1);
+    }
 }

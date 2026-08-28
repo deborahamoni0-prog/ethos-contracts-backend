@@ -4,11 +4,15 @@
 /// - L1 (in-memory): Fast, small capacity, short TTL.
 /// - L2 (persistent/Redis-compatible interface): Slower, large capacity, longer TTL.
 ///
-/// Cache coherence between levels is maintained on write (write-through)
-/// and on miss (read-through with promotion).
-use std::collections::HashMap;
+/// Cache coherence between levels is maintained on write (write-through),
+/// on miss (read-through with promotion), and via a scheduled consistency
+/// verification job with automatic drift healing (#360).
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::models::{Vault, VaultSummary};
 
@@ -22,6 +26,51 @@ pub const L2_TTL_SECS: u64 = 1800;
 
 /// L1 maximum entry count — evict LRU when exceeded.
 pub const L1_MAX_ENTRIES: usize = 500;
+
+// ── Consistency Drift Types (#360) ───────────────────────────────────────────
+
+/// Nature of detected drift between L1 and L2 cache levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriftKind {
+    /// Entry is present in L1 but missing or expired in L2.
+    L1Only,
+    /// Entry is present in L2 but missing or expired in L1.
+    L2Only,
+    /// Entry is present in both levels but the cached values disagree.
+    ValueMismatch,
+}
+
+/// Information about a single drifted cache key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheDriftDetail {
+    pub key: String,
+    pub kind: DriftKind,
+    pub description: String,
+    pub healed: bool,
+}
+
+/// Report produced by multi-level cache consistency verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheDriftReport {
+    pub checked_at: DateTime<Utc>,
+    pub checked_keys_count: usize,
+    pub drift_count: usize,
+    pub healed_count: usize,
+    pub details: Vec<CacheDriftDetail>,
+}
+
+/// Cumulative metrics for multi-level cache consistency checks and healing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct DriftMetrics {
+    /// Total number of consistency verification runs executed.
+    pub total_verifications: u64,
+    /// Total number of drifted keys detected across all runs.
+    pub total_drifts_detected: u64,
+    /// Total number of drifted keys successfully healed from source of truth.
+    pub total_drifts_healed: u64,
+    /// Timestamp of the most recent consistency verification run.
+    pub last_verification_at: Option<DateTime<Utc>>,
+}
 
 // ── Generic Cache Entry ───────────────────────────────────────────────────────
 
@@ -67,7 +116,7 @@ struct L1Cache {
     stats: L1Stats,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct L1Stats {
     pub hits: u64,
     pub misses: u64,
@@ -98,6 +147,13 @@ impl L1Cache {
         None
     }
 
+    fn peek_vault(&self, vault_id: &str) -> Option<Vault> {
+        self.vaults
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value.clone())
+    }
+
     fn set_vault(&mut self, vault_id: &str, vault: Vault, ttl: Duration) {
         self.maybe_evict(&mut self.vaults.len().clone());
         self.vaults
@@ -117,6 +173,13 @@ impl L1Cache {
         None
     }
 
+    fn peek_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
+        self.ttl_remaining
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value)
+    }
+
     fn set_ttl_remaining(&mut self, vault_id: &str, value: Option<u64>, ttl: Duration) {
         self.ttl_remaining
             .insert(vault_id.to_string(), Entry::new(value, ttl));
@@ -133,6 +196,13 @@ impl L1Cache {
         }
         self.stats.misses += 1;
         None
+    }
+
+    fn peek_summary(&self, vault_id: &str) -> Option<VaultSummary> {
+        self.summaries
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value.clone())
     }
 
     fn set_summary(&mut self, vault_id: &str, summary: VaultSummary, ttl: Duration) {
@@ -164,6 +234,14 @@ impl L1Cache {
         vault_count.max(ttl_count).max(summary_count)
     }
 
+    fn all_vault_keys(&self) -> Vec<String> {
+        self.vaults
+            .iter()
+            .filter(|(_, e)| !e.is_expired())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// LRU eviction: remove the least recently accessed entry when at capacity.
     fn maybe_evict(&mut self, current_len: &usize) {
         if *current_len >= self.max_entries {
@@ -181,10 +259,6 @@ impl L1Cache {
 }
 
 // ── L2 Cache (Redis-compatible interface) ─────────────────────────────────────
-//
-// In production this would be backed by a Redis client. Here we implement
-// the same interface with an in-memory store so the logic is testable without
-// a running Redis instance. Swap `L2Store` for a real Redis client in deployment.
 
 struct L2Cache {
     vaults: HashMap<String, Entry<Vault>>,
@@ -193,7 +267,7 @@ struct L2Cache {
     stats: L2Stats,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct L2Stats {
     pub hits: u64,
     pub misses: u64,
@@ -223,6 +297,13 @@ impl L2Cache {
         None
     }
 
+    fn peek_vault(&self, vault_id: &str) -> Option<Vault> {
+        self.vaults
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value.clone())
+    }
+
     fn set_vault(&mut self, vault_id: &str, vault: Vault, ttl: Duration) {
         self.vaults
             .insert(vault_id.to_string(), Entry::new(vault, ttl));
@@ -241,6 +322,13 @@ impl L2Cache {
         None
     }
 
+    fn peek_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
+        self.ttl_remaining
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value)
+    }
+
     fn set_ttl_remaining(&mut self, vault_id: &str, value: Option<u64>, ttl: Duration) {
         self.ttl_remaining
             .insert(vault_id.to_string(), Entry::new(value, ttl));
@@ -257,6 +345,13 @@ impl L2Cache {
         }
         self.stats.misses += 1;
         None
+    }
+
+    fn peek_summary(&self, vault_id: &str) -> Option<VaultSummary> {
+        self.summaries
+            .get(vault_id)
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value.clone())
     }
 
     fn set_summary(&mut self, vault_id: &str, summary: VaultSummary, ttl: Duration) {
@@ -287,20 +382,26 @@ impl L2Cache {
         let summary_count = self.summaries.values().filter(|e| !e.is_expired()).count();
         vault_count.max(ttl_count).max(summary_count)
     }
+
+    fn all_vault_keys(&self) -> Vec<String> {
+        self.vaults
+            .iter()
+            .filter(|(_, e)| !e.is_expired())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
 }
 
 // ── Multi-Level Cache ─────────────────────────────────────────────────────────
 
-/// Two-level cache with automatic read-through and write-through coherence.
-///
-/// Read order: L1 → L2 → miss.
-/// Write order: L1 (short TTL) + L2 (long TTL) simultaneously.
-/// Invalidation: cascades to both levels.
+/// Two-level cache with automatic read-through, write-through coherence, and
+/// periodic consistency verification and drift healing (#360).
 pub struct MultiLevelCache {
     l1: Mutex<L1Cache>,
     l2: Mutex<L2Cache>,
     l1_ttl: Duration,
     l2_ttl: Duration,
+    drift_metrics: Mutex<DriftMetrics>,
 }
 
 impl MultiLevelCache {
@@ -310,6 +411,7 @@ impl MultiLevelCache {
             l2: Mutex::new(L2Cache::new()),
             l1_ttl: Duration::from_secs(L1_TTL_SECS),
             l2_ttl: Duration::from_secs(L2_TTL_SECS),
+            drift_metrics: Mutex::new(DriftMetrics::default()),
         }
     }
 
@@ -320,6 +422,7 @@ impl MultiLevelCache {
             l2: Mutex::new(L2Cache::new()),
             l1_ttl,
             l2_ttl,
+            drift_metrics: Mutex::new(DriftMetrics::default()),
         }
     }
 
@@ -441,20 +544,193 @@ impl MultiLevelCache {
         self.l2.lock().unwrap().invalidate_all();
     }
 
+    // ── #360 Consistency Verification & Drift Healing ────────────────────────
+
+    /// Verify consistency between L1 and L2 cache entries, reporting any detected drift
+    /// and auto-healing entries by refreshing from the given `source_of_truth` resolver.
+    pub fn verify_and_heal_consistency<F>(&self, source_of_truth: F) -> CacheDriftReport
+    where
+        F: Fn(&str) -> Option<Vault>,
+    {
+        let now = Utc::now();
+        let mut keys: HashSet<String> = HashSet::new();
+
+        {
+            let l1 = self.l1.lock().unwrap();
+            for k in l1.all_vault_keys() {
+                keys.insert(k);
+            }
+        }
+        {
+            let l2 = self.l2.lock().unwrap();
+            for k in l2.all_vault_keys() {
+                keys.insert(k);
+            }
+        }
+
+        let checked_keys_count = keys.len();
+        let mut details: Vec<CacheDriftDetail> = Vec::new();
+
+        for key in &keys {
+            let l1_val = self.l1.lock().unwrap().peek_vault(key);
+            let l2_val = self.l2.lock().unwrap().peek_vault(key);
+
+            let drift_opt = match (&l1_val, &l2_val) {
+                (Some(_), None) => Some((
+                    DriftKind::L1Only,
+                    format!("Key '{key}' exists in L1 but is missing from L2"),
+                )),
+                (None, Some(_)) => Some((
+                    DriftKind::L2Only,
+                    format!("Key '{key}' exists in L2 but is missing from L1"),
+                )),
+                (Some(v1), Some(v2)) if v1 != v2 => Some((
+                    DriftKind::ValueMismatch,
+                    format!("Values for '{key}' differ between L1 and L2 (balance: {} vs {})", v1.balance, v2.balance),
+                )),
+                _ => None,
+            };
+
+            if let Some((kind, description)) = drift_opt {
+                // Auto-heal by consulting source of truth
+                let healed = match source_of_truth(key) {
+                    Some(truth) => {
+                        self.set_vault(key, truth);
+                        true
+                    }
+                    None => {
+                        // Record does not exist in source of truth; purge from both cache levels.
+                        self.invalidate(key);
+                        true
+                    }
+                };
+
+                details.push(CacheDriftDetail {
+                    key: key.clone(),
+                    kind,
+                    description,
+                    healed,
+                });
+            }
+        }
+
+        let drift_count = details.len();
+        let healed_count = details.iter().filter(|d| d.healed).count();
+
+        // Update drift metrics
+        {
+            let mut m = self.drift_metrics.lock().unwrap();
+            m.total_verifications += 1;
+            m.total_drifts_detected += drift_count as u64;
+            m.total_drifts_healed += healed_count as u64;
+            m.last_verification_at = Some(now);
+        }
+
+        CacheDriftReport {
+            checked_at: now,
+            checked_keys_count,
+            drift_count,
+            healed_count,
+            details,
+        }
+    }
+
+    /// Read-only consistency check between L1 and L2 without altering cache contents.
+    pub fn verify_consistency(&self) -> CacheDriftReport {
+        let now = Utc::now();
+        let mut keys: HashSet<String> = HashSet::new();
+
+        {
+            let l1 = self.l1.lock().unwrap();
+            for k in l1.all_vault_keys() {
+                keys.insert(k);
+            }
+        }
+        {
+            let l2 = self.l2.lock().unwrap();
+            for k in l2.all_vault_keys() {
+                keys.insert(k);
+            }
+        }
+
+        let checked_keys_count = keys.len();
+        let mut details: Vec<CacheDriftDetail> = Vec::new();
+
+        for key in &keys {
+            let l1_val = self.l1.lock().unwrap().peek_vault(key);
+            let l2_val = self.l2.lock().unwrap().peek_vault(key);
+
+            let drift_opt = match (&l1_val, &l2_val) {
+                (Some(_), None) => Some((
+                    DriftKind::L1Only,
+                    format!("Key '{key}' exists in L1 but is missing from L2"),
+                )),
+                (None, Some(_)) => Some((
+                    DriftKind::L2Only,
+                    format!("Key '{key}' exists in L2 but is missing from L1"),
+                )),
+                (Some(v1), Some(v2)) if v1 != v2 => Some((
+                    DriftKind::ValueMismatch,
+                    format!("Values for '{key}' differ between L1 and L2"),
+                )),
+                _ => None,
+            };
+
+            if let Some((kind, description)) = drift_opt {
+                details.push(CacheDriftDetail {
+                    key: key.clone(),
+                    kind,
+                    description,
+                    healed: false,
+                });
+            }
+        }
+
+        let drift_count = details.len();
+
+        {
+            let mut m = self.drift_metrics.lock().unwrap();
+            m.total_verifications += 1;
+            m.total_drifts_detected += drift_count as u64;
+            m.last_verification_at = Some(now);
+        }
+
+        CacheDriftReport {
+            checked_at: now,
+            checked_keys_count,
+            drift_count,
+            healed_count: 0,
+            details,
+        }
+    }
+
+    /// Snapshot current drift metrics.
+    pub fn drift_metrics(&self) -> DriftMetrics {
+        self.drift_metrics.lock().unwrap().clone()
+    }
+
+    /// Reset drift metrics (useful in tests).
+    pub fn reset_drift_metrics(&self) {
+        let mut m = self.drift_metrics.lock().unwrap();
+        *m = DriftMetrics::default();
+    }
+
     // ── Statistics ────────────────────────────────────────────────────────────
 
-    /// Get per-level cache statistics.
+    /// Get per-level cache statistics and drift metrics.
     pub fn get_stats(&self) -> CacheStats {
         let l1_stats = self.l1.lock().unwrap().stats.clone();
         let l2_stats = self.l2.lock().unwrap().stats.clone();
         let l1_entries = self.l1.lock().unwrap().live_entry_count();
         let l2_entries = self.l2.lock().unwrap().live_entry_count();
+        let drift = self.drift_metrics();
 
         CacheStats {
             l1: l1_stats,
             l2: l2_stats,
             l1_live_entries: l1_entries,
             l2_live_entries: l2_entries,
+            drift,
         }
     }
 }
@@ -465,12 +741,13 @@ impl Default for MultiLevelCache {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheStats {
     pub l1: L1Stats,
     pub l2: L2Stats,
     pub l1_live_entries: usize,
     pub l2_live_entries: usize,
+    pub drift: DriftMetrics,
 }
 
 // ── Unit Tests ────────────────────────────────────────────────────────────────
@@ -622,5 +899,125 @@ mod tests {
         let stats = cache.get_stats();
         assert_eq!(stats.l1_live_entries, 2);
         assert_eq!(stats.l2_live_entries, 2);
+    }
+
+    // ── #360 Tests: Drift Detection & Healing ─────────────────────────────────
+
+    #[test]
+    fn test_drift_detection_value_mismatch() {
+        let cache = MultiLevelCache::new();
+        let mut vault_l1 = make_vault("v1");
+        vault_l1.balance = 1000;
+        let mut vault_l2 = make_vault("v1");
+        vault_l2.balance = 2000;
+
+        // Manually inject mismatched values into L1 and L2
+        cache.l1.lock().unwrap().set_vault("v1", vault_l1, Duration::from_secs(60));
+        cache.l2.lock().unwrap().set_vault("v1", vault_l2, Duration::from_secs(60));
+
+        let report = cache.verify_consistency();
+        assert_eq!(report.drift_count, 1);
+        assert_eq!(report.details[0].key, "v1");
+        assert_eq!(report.details[0].kind, DriftKind::ValueMismatch);
+
+        let metrics = cache.drift_metrics();
+        assert_eq!(metrics.total_drifts_detected, 1);
+    }
+
+    #[test]
+    fn test_drift_detection_l1_only_and_l2_only() {
+        let cache = MultiLevelCache::new();
+        let vault1 = make_vault("v1");
+        let vault2 = make_vault("v2");
+
+        // v1 in L1 only
+        cache.l1.lock().unwrap().set_vault("v1", vault1, Duration::from_secs(60));
+        // v2 in L2 only
+        cache.l2.lock().unwrap().set_vault("v2", vault2, Duration::from_secs(60));
+
+        let report = cache.verify_consistency();
+        assert_eq!(report.drift_count, 2);
+
+        let v1_detail = report.details.iter().find(|d| d.key == "v1").unwrap();
+        let v2_detail = report.details.iter().find(|d| d.key == "v2").unwrap();
+
+        assert_eq!(v1_detail.kind, DriftKind::L1Only);
+        assert_eq!(v2_detail.kind, DriftKind::L2Only);
+    }
+
+    #[test]
+    fn test_auto_heal_from_source_of_truth() {
+        let cache = MultiLevelCache::new();
+        let mut vault_stale = make_vault("v1");
+        vault_stale.balance = 500;
+        cache.l1.lock().unwrap().set_vault("v1", vault_stale, Duration::from_secs(60));
+
+        // Source of truth has the authoritative state (balance 5000)
+        let true_vault = {
+            let mut v = make_vault("v1");
+            v.balance = 5000;
+            v
+        };
+
+        let report = cache.verify_and_heal_consistency(|key| {
+            if key == "v1" {
+                Some(true_vault.clone())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(report.drift_count, 1);
+        assert_eq!(report.healed_count, 1);
+        assert!(report.details[0].healed);
+
+        // Verify both L1 and L2 now reflect authoritative source of truth
+        let l1_val = cache.l1.lock().unwrap().peek_vault("v1").unwrap();
+        let l2_val = cache.l2.lock().unwrap().peek_vault("v1").unwrap();
+        assert_eq!(l1_val.balance, 5000);
+        assert_eq!(l2_val.balance, 5000);
+
+        // Verification after healing reports 0 drift
+        let fresh_report = cache.verify_consistency();
+        assert_eq!(fresh_report.drift_count, 0);
+
+        let metrics = cache.drift_metrics();
+        assert_eq!(metrics.total_drifts_healed, 1);
+    }
+
+    #[test]
+    fn test_auto_heal_clears_deleted_vault_from_cache() {
+        let cache = MultiLevelCache::new();
+        cache.l1.lock().unwrap().set_vault("v-deleted", make_vault("v-deleted"), Duration::from_secs(60));
+
+        // Source of truth returns None (record was deleted in DB)
+        let report = cache.verify_and_heal_consistency(|_| None);
+        assert_eq!(report.drift_count, 1);
+        assert_eq!(report.healed_count, 1);
+
+        // Both cache levels should be cleared
+        assert!(cache.get_vault("v-deleted").is_none());
+    }
+
+    #[test]
+    fn test_drift_metrics_reporting() {
+        let cache = MultiLevelCache::new();
+        cache.reset_drift_metrics();
+
+        let metrics_initial = cache.drift_metrics();
+        assert_eq!(metrics_initial.total_verifications, 0);
+        assert_eq!(metrics_initial.total_drifts_detected, 0);
+        assert_eq!(metrics_initial.total_drifts_healed, 0);
+
+        // Inject drift and run healing
+        cache.l1.lock().unwrap().set_vault("v1", make_vault("v1"), Duration::from_secs(60));
+        let true_v = make_vault("v1");
+        cache.verify_and_heal_consistency(|_| Some(true_v.clone()));
+
+        let metrics_after = cache.drift_metrics();
+        assert_eq!(metrics_after.total_verifications, 1);
+        assert_eq!(metrics_after.total_drifts_detected, 1);
+        assert_eq!(metrics_after.total_drifts_healed, 1);
+        assert!(metrics_after.last_verification_at.is_some());
     }
 }
