@@ -6,7 +6,7 @@ use consistency::CredentialRegistry;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
-    xdr::FromXdr, Address, Bytes, BytesN, Env, Vec,
+    xdr::FromXdr, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
@@ -101,6 +101,9 @@ pub enum VerifierError {
     /// A masked proof was not attested by a currently-registered oracle for
     /// the given claim.
     MaskedVerificationFailed = 20,
+    /// The caller is not permitted to view this credential's attestation
+    /// record at its current privacy level.
+    AccessDenied = 21,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -186,6 +189,12 @@ mod keys {
         /// proof_sha256 (of the original, unmasked proof) -> MaskingConfig,
         /// recorded by `ZkVerifierContract::mask_proof_fields`.
         MaskingConfig(BytesN<32>),
+        /// credential_id -> MaskingConfig, recorded the first time
+        /// `ZkVerifierContract::get_attestation` serves a redacted
+        /// `AttestationRecord` for that credential (i.e. an unauthorized
+        /// caller at `PrivacyLevel::Confidential`). Mirrors the proof-field
+        /// masking audit trail in `DataKey::MaskingConfig`.
+        AttestationMasking(u64),
         /// proof_sha256 -> ledger timestamp of the most recent
         /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
         LastVerificationTime(BytesN<32>),
@@ -273,10 +282,11 @@ pub struct CredentialVersionDiff {
     pub current_invalidated: bool,
 }
 
-/// Controls who may read a credential's attestation state via
-/// [`ZkVerifierContract::get_credential_at_time`]. Set per-credential by the
-/// admin via [`ZkVerifierContract::set_credential_privacy`]; defaults to
-/// `Public` for every credential until explicitly changed.
+/// Controls who may read a credential's attestation record/state via
+/// [`ZkVerifierContract::get_attestation`] (and, once restored,
+/// `get_credential_at_time`). Set per-credential by the admin via
+/// [`ZkVerifierContract::set_credential_privacy`]; defaults to `Public` for
+/// every credential until explicitly changed.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrivacyLevel {
@@ -781,6 +791,53 @@ impl ZkVerifierContract {
             .unwrap_or(PrivacyLevel::Public)
     }
 
+    /// Returns the current [`AttestationRecord`] for `credential_id` (the
+    /// oracle currently standing behind it, and its stable credential id),
+    /// or `None` if that id was never attested.
+    ///
+    /// `requester` must authorize the call (so the caller cannot be
+    /// spoofed) and is checked against the credential's current
+    /// [`PrivacyLevel`]:
+    ///
+    /// - **`Public`** — anyone may read the full record.
+    /// - **`Internal`** — the admin or a currently-registered oracle may
+    ///   read the full record; anyone else is denied with `AccessDenied`.
+    /// - **`Confidential`** — the admin may read the full record; anyone
+    ///   else receives a *redacted* copy whose sensitive fields (`oracle`)
+    ///   are masked out (see [`Self::redact_attestation_record`]), and the
+    ///   redaction is recorded on-chain in a [`MaskingConfig`] under
+    ///   `DataKey::AttestationMasking`. The record's existence and
+    ///   `credential_id` remain visible, but the attesting oracle is not
+    ///   disclosed.
+    pub fn get_attestation(
+        env: Env,
+        requester: Address,
+        credential_id: u64,
+    ) -> Option<AttestationRecord> {
+        requester.require_auth();
+
+        let record = Self::load_attestation_record(&env, credential_id)?;
+
+        match Self::credential_privacy(env.clone(), credential_id) {
+            PrivacyLevel::Public => Some(record),
+            PrivacyLevel::Internal => {
+                if Self::is_admin(&env, &requester) || Self::is_registered_oracle(&env, &requester)
+                {
+                    Some(record)
+                } else {
+                    panic_with_error!(&env, VerifierError::AccessDenied);
+                }
+            }
+            PrivacyLevel::Confidential => {
+                if Self::is_admin(&env, &requester) {
+                    Some(record)
+                } else {
+                    Some(Self::redact_attestation_record(&env, &record))
+                }
+            }
+        }
+    }
+
     // ---- helpers ----
 
     /// Structural format check for `verify_lattice_proof`'s input: `proof`
@@ -849,14 +906,77 @@ impl ZkVerifierContract {
 
     /// Panics with `OracleNotFound` unless `oracle` is currently registered.
     fn require_registered_oracle(env: &Env, oracle: &Address) {
-        let is_registered = env
-            .storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
-            .unwrap_or(false);
-        if !is_registered {
+        if !Self::is_registered_oracle(env, oracle) {
             panic_with_error!(env, VerifierError::OracleNotFound);
         }
+    }
+
+    /// Returns whether `oracle` is a currently-registered oracle.
+    fn is_registered_oracle(env: &Env, oracle: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Returns whether `address` is the contract's admin.
+    fn is_admin(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .is_some_and(|admin| &admin == address)
+    }
+
+    /// Looks up the current `AttestationRecord` for `credential_id` by
+    /// following `CredentialHashes(credential_id)` to the underlying
+    /// `Attestation(proof_hash, claim_hash)` entry. Returns `None` if the
+    /// credential id is unknown.
+    fn load_attestation_record(env: &Env, credential_id: u64) -> Option<AttestationRecord> {
+        let (proof_hash, claim_hash): (BytesN<32>, BytesN<32>) = env
+            .storage()
+            .instance()
+            .get(&DataKey::CredentialHashes(credential_id))?;
+        env.storage()
+            .instance()
+            .get(&DataKey::Attestation(proof_hash, claim_hash))
+    }
+
+    /// Returns a copy of `record` with its sensitive fields masked out, for
+    /// callers that may learn a credential exists but may not see who stands
+    /// behind it (unauthorized callers at `PrivacyLevel::Confidential`).
+    ///
+    /// The redaction is recorded on-chain so it is auditable: a
+    /// [`MaskingConfig`] — the same type `mask_proof_fields` uses for
+    /// proof-field masking — is stored under `DataKey::AttestationMasking`
+    /// keyed by the credential, with the masked-field bitmask set for
+    /// [`ATTESTATION_RECORD_FIELD_ORACLE`]. `credential_id` is never
+    /// masked, so the redacted record still identifies itself.
+    fn redact_attestation_record(env: &Env, record: &AttestationRecord) -> AttestationRecord {
+        let field_mask = 1u32 << ATTESTATION_RECORD_FIELD_ORACLE;
+        env.storage().instance().set(
+            &DataKey::AttestationMasking(record.credential_id),
+            &MaskingConfig {
+                masked_fields: env
+                    .crypto()
+                    .sha256(&Bytes::from_array(env, &field_mask.to_le_bytes()))
+                    .into(),
+                version: 1,
+            },
+        );
+        AttestationRecord {
+            credential_id: record.credential_id,
+            oracle: Self::masked_oracle(env),
+        }
+    }
+
+    /// Returns the well-defined "masked" `Address` used in place of a
+    /// redacted attestation record's `oracle`: the all-zero Ed25519 account
+    /// ([`MASKED_ORACLE_STRKEY`]). An all-zero key is not a usable Stellar
+    /// account, so a masked oracle can never be mistaken for a genuine
+    /// attesting oracle, but it is a valid `Address` value that round-trips
+    /// through storage and events.
+    fn masked_oracle(env: &Env) -> Address {
+        Address::from_string(&String::from_str(env, MASKED_ORACLE_STRKEY))
     }
 
     /// Returns the existing credential_id for `(proof_hash, claim_hash)` if

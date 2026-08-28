@@ -81,6 +81,14 @@ pub fn set_credential_privacy(env: Env, credential_id: u64, level: PrivacyLevel)
 /// Returns a credential's current PrivacyLevel (defaults to `Public`).
 pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel
 
+/// Returns the credential's current AttestationRecord (its attesting
+/// oracle and stable credential_id), gated on the caller's authorization
+/// under its PrivacyLevel. Unauthorized callers at Confidential receive a
+/// redacted record whose oracle field is masked out (recorded via
+/// MaskingConfig); unauthorized callers at Internal are denied with
+/// AccessDenied.
+pub fn get_attestation(env: Env, requester: Address, credential_id: u64) -> Option<AttestationRecord>
+
 /// Returns the credential's recorded state as of a specific version number
 /// (1-based, monotonically increasing, never reused), or `None` if that
 /// version was never recorded or has since been pruned. Same PrivacyLevel
@@ -502,10 +510,45 @@ let snapshot = client.get_credential_at_time(&requester, &1u64, &timestamp);
 `set_credential_privacy` panics with `CredentialNotFound` (#8) if
 `credential_id` was never attested, mirroring `initiate_credential_dispute`.
 
+### Attestation query path (`get_attestation`)
+
+The credential-level gating above also applies to the attestation query
+path itself: `get_attestation(requester, credential_id)` returns the
+credential's current `AttestationRecord` — the attesting oracle and its
+stable `credential_id`. `requester` must authorize the call (so the
+caller cannot be spoofed) and must satisfy the credential's
+`PrivacyLevel`:
+
+| PrivacyLevel | Authorized callers | Unauthorized callers |
+|--------------|--------------------|----------------------|
+| `Public` | anyone | — (everyone is authorized) |
+| `Internal` | admin, any registered oracle | panics with `AccessDenied` (#21) |
+| `Confidential` | admin | receive a **redacted** record |
+
+At `Confidential`, an unauthorized caller is *not* denied outright —
+denying would itself confirm the credential exists. Instead the caller
+receives a redacted `AttestationRecord` whose `oracle` field is masked
+out (replaced with the all-zero Ed25519 account
+`GAAAA...WHF`, a strkey that is not a usable Stellar account and so can
+never be mistaken for a genuine attesting oracle), while `credential_id`
+is kept so the record still identifies itself. The redaction is recorded
+on-chain in a `MaskingConfig` — the same type `mask_proof_fields` uses
+for proof-field masking — stored under `DataKey::AttestationMasking`
+keyed by the credential, so exactly what was masked remains auditable.
+
+> **Terminology note:** this enforcement model is the "Public /
+> Restricted / Private" model by another name — the codebase calls the
+> middle tier `Internal` and the most restrictive tier `Confidential`.
+> "Restricted" readers are the admin and registered oracles; "Private"
+> records are readable in full only by the admin and are redacted for
+> everyone else.
+
 ### What this does and does not cover
 
-Privacy filtering applies to `get_credential_at_time`, `get_credential_version`,
-and `diff_credential_versions` — every query that exposes a credential's full
+Privacy filtering applies to `get_attestation` (the attestation query
+path) and, once the temporal-query API described above is restored, to
+`get_credential_at_time`, `get_credential_version`, and
+`diff_credential_versions` — every query that exposes a credential's full
 attestation state (oracle, invalidated flag, timestamp). It intentionally
 does **not** gate `verify_claim`: that call
 already requires the caller to possess the exact `proof` and `claim` bytes,
@@ -782,6 +825,19 @@ fn test_oracle_attestation_flow() {
 ---
 
 ## Error Codes
+
+> **Numbering note:** this table documents the full API described in this
+> document, some of which is not yet present in `src/lib.rs` (see the
+> note above the "Additional error codes" section). In the current
+> `src/lib.rs`, `AccessDenied` is error **21** — not 16 as listed below —
+> because the current error numbering differs from the documented API:
+> the hierarchy errors are 12-16 (`CredentialNotFound` 12,
+> `SelfReferentialParent` 13, `ParentAlreadySet` 14,
+> `CredentialChainTooDeep` 15, `ParentCredentialInvalid` 16), the
+> lattice/masking errors are 17-20 (see "Additional error codes" above),
+> and `AccessDenied` is 21. Codes 8-11 and `VersionNotFound` (17 below)
+> belong to the dispute / version-history API that is not yet present in
+> `src/lib.rs`.
 
 | Code | Name | Description |
 |------|------|-------------|
