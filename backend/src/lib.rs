@@ -1,6 +1,8 @@
 pub mod audit;
 pub mod cache;
 pub mod consensus;
+#[cfg(test)]
+mod cross_cutting_integration_tests;
 pub mod contract_version_check;
 pub mod db;
 pub mod error;
