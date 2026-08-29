@@ -12,6 +12,12 @@ pub struct Metrics {
     pub request_errors_total: AtomicU64,
     pub http_requests_total: AtomicU64,
     pub contract_paused: AtomicU64,
+    /// Total scheduled consensus (cache reconciliation) checks run.
+    pub consensus_checks_total: AtomicU64,
+    /// Total key conflicts detected across all consensus checks.
+    pub consensus_conflicts_total: AtomicU64,
+    /// 1 if the most recent consensus check found the cache consistent, 0 otherwise.
+    pub consensus_consistent: AtomicU64,
 }
 
 impl Metrics {
@@ -65,6 +71,24 @@ impl Metrics {
             "1 if contract is paused, 0 otherwise",
             self.contract_paused.load(Ordering::Relaxed),
         );
+        push_counter(
+            &mut out,
+            "ethos_protocol_consensus_checks_total",
+            "Total scheduled consensus reconciliation checks run",
+            self.consensus_checks_total.load(Ordering::Relaxed),
+        );
+        push_counter(
+            &mut out,
+            "ethos_protocol_consensus_conflicts_total",
+            "Total cache key conflicts detected by consensus checks",
+            self.consensus_conflicts_total.load(Ordering::Relaxed),
+        );
+        push_gauge(
+            &mut out,
+            "ethos_protocol_consensus_consistent",
+            "1 if the most recent consensus check found the cache consistent, 0 otherwise",
+            self.consensus_consistent.load(Ordering::Relaxed),
+        );
 
         out
     }
@@ -106,6 +130,19 @@ mod tests {
         assert!(output.contains("ethos_protocol_vaults_total 5"));
         assert!(output.contains("ethos_protocol_checkins_total 10"));
         assert!(output.contains("ethos_protocol_contract_paused 1"));
+    }
+
+    #[test]
+    fn test_render_contains_consensus_metrics() {
+        let m = Metrics::new();
+        m.consensus_checks_total.store(3, Ordering::Relaxed);
+        m.consensus_conflicts_total.store(2, Ordering::Relaxed);
+        m.consensus_consistent.store(0, Ordering::Relaxed);
+
+        let output = m.render();
+        assert!(output.contains("ethos_protocol_consensus_checks_total 3"));
+        assert!(output.contains("ethos_protocol_consensus_conflicts_total 2"));
+        assert!(output.contains("ethos_protocol_consensus_consistent 0"));
     }
 
     #[test]

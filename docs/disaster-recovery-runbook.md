@@ -15,6 +15,31 @@ This runbook covers emergency procedures for Ethos-Protocol operators. Follow ea
 
 ---
 
+## Automation Hooks
+
+Two of the manual procedures below are also exposed as admin-only,
+audited API endpoints (`backend/src/dr_automation.rs`) to reduce the
+chance of a mistyped command during an active incident. See
+`docs/dr-automation.md` for the full API reference. Summary:
+
+- **Failover trigger** (used alongside §1 below): `POST /admin/dr/failover/trigger`.
+  Destructive — requires a confirmation token first minted via
+  `POST /admin/dr/confirmations`. Opens a Sev1 incident automatically.
+  Resolve with `POST /admin/dr/failover/resolve` (same confirmation-token
+  requirement) once root cause is fixed; check current state any time via
+  `GET /admin/dr/failover/status`.
+- **Backup restore validation** (used alongside §4 below):
+  `POST /admin/dr/backup-restore/validate`. Read-only — no confirmation
+  token required. Runs the same checksum + integrity + restore-simulation
+  checks as `POST /admin/validate-backup` (see `docs/backup-validation.md`)
+  and opens an incident on checksum mismatch.
+- Every DR automation action (executed or attempted) is logged to
+  `GET /admin/dr/history` for the post-incident review in §8.
+
+These hooks supplement, not replace, the manual `stellar contract invoke`
+procedures below — use whichever is faster and safer to execute correctly
+under the circumstances.
+
 ## 1. Emergency Contract Pause
 
 Use when an exploit or critical bug is detected.
@@ -120,6 +145,9 @@ stellar contract invoke \
 
 If contract state is suspected to be corrupted or inconsistent:
 
+0. If off-chain backups are in play, validate them first with
+   `POST /admin/dr/backup-restore/validate` (see **Automation Hooks**
+   above) before trusting a restore from them.
 1. **Do not unpause** until the state is verified.
 2. Query all affected vaults using `get_vault` and compare against off-chain records.
 3. Use `get_release_status` to confirm vault statuses.
