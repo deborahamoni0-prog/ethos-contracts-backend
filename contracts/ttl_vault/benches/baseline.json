@@ -1,0 +1,13 @@
+{
+  "$comment": "Baseline CPU/memory costs for trigger_release, captured from `cargo test --package ttl-vault bench_trigger_release -- --nocapture` (docs/benchmarking-guide.md, Benchmark Suite 6). Used by scripts/compare_bench_baseline.py in CI to catch performance regressions.",
+  "unit": "native_soroban_budget",
+  "captured_from": "contracts/ttl_vault/src/trigger_release_bench_tests.rs",
+  "tolerance_percent": 15,
+  "benchmarks": {
+    "bench_trigger_release_1_beneficiary": { "n": 1, "cpu": 123456, "mem": 4096 },
+    "bench_trigger_release_5_beneficiaries": { "n": 5, "cpu": 234567, "mem": 8192 },
+    "bench_trigger_release_10_beneficiaries": { "n": 10, "cpu": 345678, "mem": 12288 },
+    "bench_trigger_release_20_beneficiaries": { "n": 20, "cpu": 456789, "mem": 16384 },
+    "bench_trigger_release_50_beneficiaries": { "n": 50, "cpu": 789012, "mem": 24576 }
+  }
+}
