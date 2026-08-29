@@ -13,10 +13,8 @@ use chrono::Utc;
 
 use crate::audit::{authorize_admin, log_state_modification};
 use crate::cache::VaultCache;
-use crate::db::{
-    create_vault_store, get_vault_cached, invalidate_vault_cache, AuditLogQuery, Db,
-};
-use crate::models::{Vault, VaultStatus};
+use crate::db::{create_vault_store, get_vault_cached, invalidate_vault_cache, Db};
+use crate::models::{AuditLogQuery, Vault, VaultStatus};
 use crate::websocket::MessageRateLimiter;
 
 /// `authorize_admin` reads the process-wide `ADMIN_API_KEY` env var, so tests

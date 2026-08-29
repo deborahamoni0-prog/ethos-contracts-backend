@@ -9,6 +9,8 @@ pub mod error;
 pub mod graphql;
 pub mod handlers;
 pub mod metrics;
+#[cfg(test)]
+mod migration_rollback_tests;
 pub mod models;
 pub mod notifications;
 pub mod routes;
