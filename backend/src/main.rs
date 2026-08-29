@@ -11,7 +11,6 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
-    backup_validation::create_metadata_store,
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
@@ -30,14 +29,9 @@ use ethos_protocol_backend::{
         capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
         DegradationState,
     },
-    dr_automation::{
-        dr_history, failover_status, prepare_confirmation, resolve_failover, trigger_failover,
-        validate_backup_restore, DrAutomationState,
-    },
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
-    health_routing::{list_health, routing_metrics, test_routing_decision},
     incidents::{
         add_timeline_entry, create_incident, escalate_incident, get_incident, list_incidents,
         update_incident_status, IncidentState,
@@ -198,29 +192,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
         .route("/webhooks/verify", post(verify_webhook))
-        // ── Health-based routing admin routes (#374) ──────────────────────────
-        .route("/admin/routing/health", get(list_health))
-        .route("/admin/routing/metrics", get(routing_metrics))
-        .route("/admin/routing/test", post(test_routing_decision))
-        // ── Incident tracking routes (#373, #375, #376) ───────────────────────
+        // ── Incident tracking routes (#373) ───────────────────────────────────
         .route("/incidents", post(create_incident).get(list_incidents))
         .route("/incidents/:id", get(get_incident))
         .route("/incidents/:id/timeline", post(add_timeline_entry))
         .route("/incidents/:id/status", post(update_incident_status))
         .route("/incidents/:id/escalate", post(escalate_incident))
-        // ── Backup validation routes (#81, #375) ──────────────────────────────
-        .route("/admin/backups/register", post(routes::register_backup))
-        .route("/admin/validate-backup", post(routes::validate_backup))
-        // ── Disaster recovery runbook automation routes (#376) ────────────────
-        .route("/admin/dr/confirmations", post(prepare_confirmation))
-        .route("/admin/dr/failover/trigger", post(trigger_failover))
-        .route("/admin/dr/failover/resolve", post(resolve_failover))
-        .route("/admin/dr/failover/status", get(failover_status))
-        .route(
-            "/admin/dr/backup-restore/validate",
-            post(validate_backup_restore),
-        )
-        .route("/admin/dr/history", get(dr_history))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
@@ -352,18 +329,14 @@ async fn main() {
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
 
     let incident_state = Arc::new(IncidentState::new());
-    let backup_metadata_store = create_metadata_store();
-    let dr_automation_state = Arc::new(DrAutomationState::new());
 
     // ── Background scheduler (reminders, TTL insurance, retention, secret
-    // rotation, backup checksum validation (#375), consensus reconciliation
-    // (#373)) ──────────────────────────────────────────────────────────────
+    // rotation, consensus reconciliation (#373)) ──────────────────────────
     let scheduler_ctx = SchedulerContext {
         db: Arc::clone(&db),
         consensus: Arc::clone(&consensus),
         metrics: Arc::clone(&metrics),
         incident_state: Arc::clone(&incident_state),
-        backup_metadata_store: Arc::clone(&backup_metadata_store),
     };
     tokio::spawn(async move {
         scheduler::run(scheduler_ctx).await;
@@ -393,8 +366,6 @@ async fn main() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state,
-        backup_metadata_store,
-        dr_automation_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

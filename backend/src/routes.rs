@@ -342,42 +342,13 @@ pub async fn get_query_cache_stats(
     Json(state.query_cache.stats())
 }
 
-// ── #81 / #375: Backup Validation Endpoints ─────────────────────────────────
-
-/// POST /admin/backups/register
-///
-/// Body: `{"backup_id": "...", "data_base64": "..."}`
-///
-/// Records the SHA-256 checksum of a newly created backup so that a later
-/// `POST /admin/validate-backup` call can detect silent corruption by
-/// comparing against it (#375).
-pub async fn register_backup(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<crate::models::RegisterBackupRequest>,
-) -> Result<(StatusCode, Json<crate::backup_validation::BackupMetadata>), AppError> {
-    use base64::Engine as _;
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(&body.data_base64)
-        .map_err(|e| AppError::InvalidInput(format!("invalid base64 data: {e}")))?;
-
-    let metadata = crate::backup_validation::BackupValidator::register_backup(
-        &state.backup_metadata_store,
-        &body.backup_id,
-        &data,
-    );
-    Ok((StatusCode::CREATED, Json(metadata)))
-}
+// ── #81: Backup Validation Endpoint ─────────────────────────────────────────
 
 /// POST /admin/validate-backup
 ///
 /// Body: `{"backup_id": "...", "data_base64": "..."}`
-///
-/// Validates integrity, checksum (against the metadata recorded by
-/// `register_backup`), and restore-simulation. A checksum mismatch opens an
-/// incident via `incidents.rs` so silent corruption doesn't go unnoticed
-/// (#375).
 pub async fn validate_backup(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(body): Json<crate::models::BackupValidateRequest>,
 ) -> Result<Json<crate::backup_validation::BackupValidationResult>, AppError> {
     // Decode the base64-encoded backup payload.
@@ -386,28 +357,7 @@ pub async fn validate_backup(
         .decode(&body.data_base64)
         .map_err(|e| AppError::InvalidInput(format!("invalid base64 data: {e}")))?;
 
-    let result = crate::backup_validation::BackupValidator::validate_backup(
-        &state.backup_metadata_store,
-        &body.backup_id,
-        &data,
-    );
-
-    if matches!(
-        result.checksum_status,
-        crate::backup_validation::ChecksumStatus::Mismatch { .. }
-    ) {
-        crate::incidents::open_incident(
-            &state.incident_state.store,
-            "Backup checksum mismatch detected",
-            format!(
-                "POST /admin/validate-backup found a checksum mismatch for backup '{}': {}",
-                result.backup_id,
-                result.error.clone().unwrap_or_default()
-            ),
-            crate::incidents::IncidentSeverity::Sev2,
-        );
-    }
-
+    let result = crate::backup_validation::BackupValidator::validate_backup(&body.backup_id, &data);
     Ok(Json(result))
 }
 

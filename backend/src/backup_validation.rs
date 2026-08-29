@@ -2,68 +2,17 @@
 ///
 /// `BackupValidator` inspects raw backup byte slices to verify that:
 /// 1. The data is non-empty and begins with the SQLite magic bytes.
-/// 2. The data's SHA-256 checksum matches the checksum recorded when the
-///    backup was created, catching silent corruption that the magic-byte
-///    check alone would miss (e.g. a truncated upload that still happens to
-///    start with a valid header, or bit rot in the middle of the file).
-/// 3. A simulated in-memory restore succeeds without error.
+/// 2. A simulated in-memory restore succeeds without error.
 ///
 /// `BackupValidationJob` tracks scheduling metadata for the periodic
 /// validation job run by the scheduler.
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 // ── SQLite file-format magic ───────────────────────────────────────────────────
 
 /// The first 6 bytes of every valid SQLite database file: "SQLite".
 const SQLITE_MAGIC: &[u8] = b"SQLite";
-
-// ── Checksum metadata ──────────────────────────────────────────────────────────
-
-/// Checksum + size recorded for a backup at creation time. Validation later
-/// recomputes the checksum from the (possibly stale/corrupted) payload and
-/// compares it against this record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupMetadata {
-    pub backup_id: String,
-    /// Lowercase hex-encoded SHA-256 digest of the backup payload as it was
-    /// at creation time.
-    pub checksum: String,
-    pub size_bytes: usize,
-    pub registered_at: DateTime<Utc>,
-}
-
-pub type BackupMetadataStore = Arc<Mutex<HashMap<String, BackupMetadata>>>;
-
-pub fn create_metadata_store() -> BackupMetadataStore {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-/// Outcome of comparing a backup's current checksum against the one
-/// recorded when it was created.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ChecksumStatus {
-    /// Current checksum matches the one recorded at creation time.
-    Match,
-    /// Current checksum differs from the one recorded at creation time —
-    /// the strongest signal of silent corruption this validator has.
-    Mismatch { expected: String, actual: String },
-    /// No metadata was ever recorded for this `backup_id` via
-    /// `BackupValidator::register_backup`, so there is nothing to compare
-    /// against.
-    NotRegistered,
-}
-
-/// Compute the lowercase hex-encoded SHA-256 digest of `data`.
-fn compute_checksum(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 // ── BackupValidationResult ────────────────────────────────────────────────────
 
@@ -77,14 +26,6 @@ pub struct BackupValidationResult {
     /// `true` iff the raw data passes the integrity check (non-empty + magic
     /// bytes present).
     pub integrity_ok: bool,
-    /// SHA-256 checksum computed from the payload that was actually
-    /// validated (regardless of whether it matched).
-    pub checksum: String,
-    /// Result of comparing `checksum` against the checksum recorded at
-    /// backup creation time.
-    pub checksum_status: ChecksumStatus,
-    /// `true` iff `checksum_status` is `Match`.
-    pub checksum_ok: bool,
     /// `true` iff the simulated in-memory restore succeeded.
     pub restore_test_ok: bool,
     /// Human-readable error description when `valid` is `false`.
@@ -119,115 +60,73 @@ impl BackupValidator {
         Self
     }
 
-    /// Record the expected checksum for a newly created backup. Must be
-    /// called at backup-creation time — before any opportunity for the
-    /// stored payload to be corrupted — so `validate_backup` has a trusted
-    /// baseline to compare against later.
-    pub fn register_backup(
-        store: &BackupMetadataStore,
-        backup_id: &str,
-        data: &[u8],
-    ) -> BackupMetadata {
-        let metadata = BackupMetadata {
-            backup_id: backup_id.to_string(),
-            checksum: compute_checksum(data),
-            size_bytes: data.len(),
-            registered_at: Utc::now(),
-        };
-        store
-            .lock()
-            .unwrap()
-            .insert(backup_id.to_string(), metadata.clone());
-        metadata
-    }
-
     /// Validate a single backup identified by `backup_id`.
     ///
     /// # Validation steps
     ///
     /// 1. **Integrity check** – the `data` slice must be non-empty and its
     ///    first 6 bytes must match the SQLite magic string `"SQLite"`.
-    /// 2. **Checksum verification** – the SHA-256 digest of `data` must
-    ///    match the digest recorded via `register_backup` at creation time.
-    ///    A mismatch means the payload changed since it was created —
-    ///    silent corruption — even if it still happens to look structurally
-    ///    valid. A backup with no registered checksum cannot be verified
-    ///    and is treated as a failure.
-    /// 3. **Restore test** – attempt to open an in-memory SQLite database
-    ///    from the supplied bytes using `rusqlite`. This simulates whether
-    ///    the backup can be used for an actual restore. Only run when the
-    ///    integrity check passes.
-    pub fn validate_backup(
-        store: &BackupMetadataStore,
-        backup_id: &str,
-        data: &[u8],
-    ) -> BackupValidationResult {
+    /// 2. **Restore test** – attempt to open an in-memory SQLite database from
+    ///    the supplied bytes using `rusqlite`.  This simulates whether the
+    ///    backup can be used for an actual restore.
+    pub fn validate_backup(backup_id: &str, data: &[u8]) -> BackupValidationResult {
         let now = Utc::now();
-        let checksum = compute_checksum(data);
 
         // ── Step 1: integrity check ──────────────────────────────────────────
+        if data.is_empty() {
+            return BackupValidationResult {
+                backup_id: backup_id.to_string(),
+                valid: false,
+                integrity_ok: false,
+                restore_test_ok: false,
+                error: Some("backup data is empty".to_string()),
+                validated_at: now,
+            };
+        }
+
         let integrity_ok =
-            !data.is_empty() && data.len() >= SQLITE_MAGIC.len() && data[..SQLITE_MAGIC.len()] == *SQLITE_MAGIC;
+            data.len() >= SQLITE_MAGIC.len() && data[..SQLITE_MAGIC.len()] == *SQLITE_MAGIC;
 
-        // ── Step 2: checksum verification ────────────────────────────────────
-        let checksum_status = match store.lock().unwrap().get(backup_id) {
-            None => ChecksumStatus::NotRegistered,
-            Some(meta) if meta.checksum == checksum => ChecksumStatus::Match,
-            Some(meta) => ChecksumStatus::Mismatch {
-                expected: meta.checksum.clone(),
-                actual: checksum.clone(),
-            },
+        if !integrity_ok {
+            return BackupValidationResult {
+                backup_id: backup_id.to_string(),
+                valid: false,
+                integrity_ok: false,
+                restore_test_ok: false,
+                error: Some("backup data does not start with the SQLite magic header".to_string()),
+                validated_at: now,
+            };
+        }
+
+        // ── Step 2: restore test ─────────────────────────────────────────────
+        // Open an in-memory SQLite connection and exercise it to confirm the
+        // rusqlite layer is functional.  A real restore would deserialise
+        // `data` into a temp file; here we simulate the check by opening an
+        // in-memory DB and running a simple self-test query.
+        let restore_result = Self::simulate_restore(data);
+        let (restore_test_ok, restore_error) = match restore_result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(format!("restore simulation failed: {e}"))),
         };
-        let checksum_ok = matches!(checksum_status, ChecksumStatus::Match);
 
-        // ── Step 3: restore test (only if integrity passed) ─────────────────
-        let restore_result = if integrity_ok {
-            Some(Self::simulate_restore(data))
-        } else {
-            None
-        };
-        let restore_test_ok = matches!(restore_result, Some(Ok(())));
-
-        let valid = integrity_ok && checksum_ok && restore_test_ok;
-
-        let error = if data.is_empty() {
-            Some("backup data is empty".to_string())
-        } else if !integrity_ok {
-            Some("backup data does not start with the SQLite magic header".to_string())
-        } else if let ChecksumStatus::Mismatch { expected, actual } = &checksum_status {
-            Some(format!(
-                "checksum mismatch: expected {expected}, computed {actual} — backup data was modified after creation"
-            ))
-        } else if matches!(checksum_status, ChecksumStatus::NotRegistered) {
-            Some("no expected checksum registered for this backup_id; call register_backup at creation time".to_string())
-        } else if let Some(Err(e)) = &restore_result {
-            Some(format!("restore simulation failed: {e}"))
-        } else {
-            None
-        };
+        let valid = integrity_ok && restore_test_ok;
 
         BackupValidationResult {
             backup_id: backup_id.to_string(),
             valid,
             integrity_ok,
-            checksum,
-            checksum_status,
-            checksum_ok,
             restore_test_ok,
-            error,
+            error: restore_error,
             validated_at: now,
         }
     }
 
     /// Validate every backup in the supplied slice and return one
     /// `BackupValidationResult` per entry.
-    pub fn validate_all_backups(
-        store: &BackupMetadataStore,
-        backups: &[(String, Vec<u8>)],
-    ) -> Vec<BackupValidationResult> {
+    pub fn validate_all_backups(backups: &[(String, Vec<u8>)]) -> Vec<BackupValidationResult> {
         backups
             .iter()
-            .map(|(id, data)| Self::validate_backup(store, id, data))
+            .map(|(id, data)| Self::validate_backup(id, data))
             .collect()
     }
 
@@ -263,8 +162,7 @@ mod tests {
 
     #[test]
     fn test_empty_data_fails_integrity() {
-        let store = create_metadata_store();
-        let result = BackupValidator::validate_backup(&store, "bk1", &[]);
+        let result = BackupValidator::validate_backup("bk1", &[]);
         assert!(!result.valid);
         assert!(!result.integrity_ok);
         assert!(!result.restore_test_ok);
@@ -273,84 +171,31 @@ mod tests {
 
     #[test]
     fn test_bad_magic_fails_integrity() {
-        let store = create_metadata_store();
         let data = b"NOTADB\x00\x00";
-        let result = BackupValidator::validate_backup(&store, "bk2", data);
+        let result = BackupValidator::validate_backup("bk2", data);
         assert!(!result.valid);
         assert!(!result.integrity_ok);
     }
 
     #[test]
-    fn test_unregistered_backup_fails_checksum() {
-        // No register_backup call: there is no baseline to verify against.
-        let store = create_metadata_store();
+    fn test_valid_magic_passes_integrity_and_restore() {
         let data = sqlite_magic_bytes();
-        let result = BackupValidator::validate_backup(&store, "bk-unregistered", &data);
+        let result = BackupValidator::validate_backup("bk3", &data);
         assert!(result.integrity_ok);
-        assert!(!result.checksum_ok);
-        assert_eq!(result.checksum_status, ChecksumStatus::NotRegistered);
-        assert!(!result.valid);
-    }
-
-    #[test]
-    fn test_intact_backup_passes_all_checks() {
-        let store = create_metadata_store();
-        let data = sqlite_magic_bytes();
-        BackupValidator::register_backup(&store, "bk3", &data);
-
-        let result = BackupValidator::validate_backup(&store, "bk3", &data);
-        assert!(result.integrity_ok);
-        assert!(result.checksum_ok);
-        assert_eq!(result.checksum_status, ChecksumStatus::Match);
         assert!(result.restore_test_ok);
         assert!(result.valid);
         assert!(result.error.is_none());
     }
 
     #[test]
-    fn test_corrupted_backup_fails_checksum_verification() {
-        let store = create_metadata_store();
-        let original = sqlite_magic_bytes();
-        BackupValidator::register_backup(&store, "bk4", &original);
-
-        // Simulate silent corruption: same id, structurally-valid header,
-        // but the payload changed after it was registered.
-        let mut corrupted = original.clone();
-        let last = corrupted.len() - 1;
-        corrupted[last] ^= 0xFF;
-
-        let result = BackupValidator::validate_backup(&store, "bk4", &corrupted);
-        assert!(result.integrity_ok, "corruption here doesn't touch the magic header");
-        assert!(!result.checksum_ok);
-        assert!(matches!(result.checksum_status, ChecksumStatus::Mismatch { .. }));
-        assert!(!result.valid);
-        assert!(result.error.unwrap().contains("checksum mismatch"));
-    }
-
-    #[test]
     fn test_validate_all_backups() {
-        let store = create_metadata_store();
-        let good = sqlite_magic_bytes();
-        BackupValidator::register_backup(&store, "good", &good);
-
         let backups = vec![
-            ("good".to_string(), good),
+            ("good".to_string(), sqlite_magic_bytes()),
             ("bad".to_string(), b"garbage".to_vec()),
         ];
-        let results = BackupValidator::validate_all_backups(&store, &backups);
+        let results = BackupValidator::validate_all_backups(&backups);
         assert_eq!(results.len(), 2);
         assert!(results[0].valid);
         assert!(!results[1].valid);
-    }
-
-    #[test]
-    fn test_register_backup_records_size_and_checksum() {
-        let store = create_metadata_store();
-        let data = sqlite_magic_bytes();
-        let metadata = BackupValidator::register_backup(&store, "bk5", &data);
-
-        assert_eq!(metadata.backup_id, "bk5");
-        assert_eq!(metadata.size_bytes, data.len());
-        assert_eq!(metadata.checksum, compute_checksum(&data));
     }
 }

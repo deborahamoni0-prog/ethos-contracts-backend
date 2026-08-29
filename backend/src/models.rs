@@ -495,14 +495,6 @@ pub struct BackupValidateRequest {
     pub data_base64: String,
 }
 
-/// Request body for `POST /admin/backups/register`: record the expected
-/// checksum for a backup at creation time, before it is ever validated.
-#[derive(Debug, Deserialize)]
-pub struct RegisterBackupRequest {
-    pub backup_id: String,
-    pub data_base64: String,
-}
-
 // ── Task 3: Sharing & Collaboration ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

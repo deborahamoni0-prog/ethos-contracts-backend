@@ -29,19 +29,9 @@ use serde::{Deserialize, Serialize};
 /// reduced weight to full weight.
 const SLOW_START_REQUESTS: u32 = 10;
 
-/// Consecutive failures after which an endpoint is marked unhealthy and
-/// routed around entirely (weight 0).
+/// Consecutive failures after which an endpoint is treated as unhealthy and
+/// routed around entirely (weight 0) until it recovers.
 const UNHEALTHY_THRESHOLD: u32 = 5;
-
-/// Consecutive successes an unhealthy endpoint must accumulate before it is
-/// marked healthy again and re-added to rotation.
-///
-/// This hysteresis band is intentionally lower than `UNHEALTHY_THRESHOLD` so
-/// a failing endpoint is routed around quickly, but recovery still requires
-/// more than a single lucky response. Without it, an endpoint whose success
-/// rate hovers right at the failure threshold would flip in and out of
-/// rotation on alternating requests.
-const HEALTHY_RECOVERY_THRESHOLD: u32 = 3;
 
 /// Exponential moving average smoothing factor applied to each new outcome.
 const EWMA_ALPHA: f64 = 0.3;
@@ -59,15 +49,6 @@ pub struct EndpointHealth {
     pub total_successes: u32,
     pub total_failures: u32,
     pub consecutive_failures: u32,
-    /// Consecutive successes since the last failure. Only meaningful for
-    /// deciding recovery while `unhealthy` is `true`; reset to 0 on failure.
-    pub consecutive_successes: u32,
-    /// Sticky unhealthy flag: set once `consecutive_failures` crosses
-    /// `UNHEALTHY_THRESHOLD`, and only cleared once `consecutive_successes`
-    /// reaches `HEALTHY_RECOVERY_THRESHOLD`. This hysteresis band is what
-    /// prevents an endpoint hovering at the threshold from flapping in and
-    /// out of rotation on every other request.
-    pub unhealthy: bool,
     /// Requests served so far while ramping up from slow-start.
     pub slow_start_requests_served: u32,
     /// Current effective weight in `[0.0, 1.0]`, combining health + slow-start.
@@ -86,8 +67,6 @@ impl EndpointHealth {
             total_successes: 0,
             total_failures: 0,
             consecutive_failures: 0,
-            consecutive_successes: 0,
-            unhealthy: false,
             slow_start_requests_served: 0,
             weight: slow_start_weight(0),
             first_seen: now,
@@ -96,7 +75,7 @@ impl EndpointHealth {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.unhealthy
+        self.consecutive_failures < UNHEALTHY_THRESHOLD
     }
 }
 
@@ -173,19 +152,9 @@ pub fn record_outcome(state: &HealthRoutingState, endpoint: &str, success: bool)
     if success {
         health.total_successes += 1;
         health.consecutive_failures = 0;
-        health.consecutive_successes += 1;
     } else {
         health.total_failures += 1;
         health.consecutive_failures += 1;
-        health.consecutive_successes = 0;
-    }
-
-    // Mark unhealthy once failures cross the threshold; only clear it once
-    // enough consecutive successes have accumulated (hysteresis band).
-    if !health.unhealthy && health.consecutive_failures >= UNHEALTHY_THRESHOLD {
-        health.unhealthy = true;
-    } else if health.unhealthy && health.consecutive_successes >= HEALTHY_RECOVERY_THRESHOLD {
-        health.unhealthy = false;
     }
 
     let outcome_value = if success { 1.0 } else { 0.0 };
@@ -273,8 +242,8 @@ pub async fn test_routing_decision(
         Some(health) if !health.is_healthy() => (
             0.0,
             format!(
-                "endpoint marked unhealthy after {} consecutive failures; needs {}/{} consecutive successes to recover",
-                health.consecutive_failures, health.consecutive_successes, HEALTHY_RECOVERY_THRESHOLD
+                "endpoint marked unhealthy after {} consecutive failures",
+                health.consecutive_failures
             ),
         ),
         Some(health) if health.slow_start_requests_served < SLOW_START_REQUESTS => (
@@ -299,87 +268,4 @@ pub async fn test_routing_decision(
         weight,
         reason,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn record_n(state: &HealthRoutingState, endpoint: &str, success: bool, n: u32) {
-        for _ in 0..n {
-            record_outcome(state, endpoint, success);
-        }
-    }
-
-    #[test]
-    fn marks_unhealthy_after_threshold_failures() {
-        let state = HealthRoutingState::new();
-        record_n(&state, "ep", false, UNHEALTHY_THRESHOLD);
-        assert!(!should_route(&state, "ep"));
-        assert_eq!(routing_weight(&state, "ep"), 0.0);
-    }
-
-    #[test]
-    fn single_success_does_not_clear_unhealthy() {
-        // Regression test for flapping: a single success right after crossing
-        // the failure threshold must NOT immediately re-admit the endpoint.
-        let state = HealthRoutingState::new();
-        record_n(&state, "ep", false, UNHEALTHY_THRESHOLD);
-        assert!(!should_route(&state, "ep"));
-
-        record_outcome(&state, "ep", true);
-        assert!(
-            !should_route(&state, "ep"),
-            "endpoint should still be unhealthy after only one success"
-        );
-    }
-
-    #[test]
-    fn recovers_after_hysteresis_threshold_successes() {
-        let state = HealthRoutingState::new();
-        record_n(&state, "ep", false, UNHEALTHY_THRESHOLD);
-        assert!(!should_route(&state, "ep"));
-
-        record_n(&state, "ep", true, HEALTHY_RECOVERY_THRESHOLD);
-        assert!(
-            should_route(&state, "ep"),
-            "endpoint should recover after {HEALTHY_RECOVERY_THRESHOLD} consecutive successes"
-        );
-    }
-
-    #[test]
-    fn alternating_outcomes_do_not_flap_once_unhealthy() {
-        // Simulate a flaky endpoint oscillating success/failure right at the
-        // boundary. Without hysteresis this would flip weight to nonzero on
-        // every success; with it, it should stay unhealthy the whole time
-        // because it never strings together HEALTHY_RECOVERY_THRESHOLD wins.
-        let state = HealthRoutingState::new();
-        record_n(&state, "ep", false, UNHEALTHY_THRESHOLD);
-        assert!(!should_route(&state, "ep"));
-
-        for _ in 0..10 {
-            record_outcome(&state, "ep", true);
-            record_outcome(&state, "ep", false);
-            assert!(
-                !should_route(&state, "ep"),
-                "endpoint must not flap back into rotation on isolated successes"
-            );
-        }
-    }
-
-    #[test]
-    fn failure_after_partial_recovery_resets_success_streak() {
-        let state = HealthRoutingState::new();
-        record_n(&state, "ep", false, UNHEALTHY_THRESHOLD);
-        record_n(&state, "ep", true, HEALTHY_RECOVERY_THRESHOLD - 1);
-        assert!(!should_route(&state, "ep"));
-
-        // One failure before hitting the recovery threshold resets progress.
-        record_outcome(&state, "ep", false);
-        record_n(&state, "ep", true, HEALTHY_RECOVERY_THRESHOLD - 1);
-        assert!(
-            !should_route(&state, "ep"),
-            "a failure mid-recovery should reset the consecutive-success streak"
-        );
-    }
 }

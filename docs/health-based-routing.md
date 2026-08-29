@@ -19,36 +19,14 @@ Each delivery attempt updates the target's `EndpointHealth` via
   behavior dominates the score without a single blip causing a swing.
 - **Consecutive failures** — reset to 0 on any success. Once a target hits
   `UNHEALTHY_THRESHOLD` (5) consecutive failures it is marked unhealthy and
-  its weight drops to `0.0`.
+  its weight drops to `0.0` until it succeeds again.
 - **Slow start** — a target's first `SLOW_START_REQUESTS` (10) attempts ramp
-  linearly from 10% to 100% weight, so a newly registered endpoint is
-  exercised cautiously rather than immediately taking full traffic.
+  linearly from 10% to 100% weight, so a newly registered or just-recovered
+  endpoint is exercised cautiously rather than immediately taking full
+  traffic.
 
 Effective `weight = slow_start_ramp × health_factor`, where `health_factor`
 is the success-rate EWMA if the endpoint is healthy, or `0.0` if it isn't.
-
-## Flapping Prevention (Hysteresis)
-
-Marking an endpoint unhealthy and healthy again use **different**
-thresholds, on purpose:
-
-- **Mark unhealthy**: `UNHEALTHY_THRESHOLD` (5) consecutive failures.
-- **Mark healthy again**: `HEALTHY_RECOVERY_THRESHOLD` (3) consecutive
-  successes, counted from the point the endpoint went unhealthy.
-
-An endpoint stays flagged `unhealthy` (and therefore weight `0.0`) for the
-entire time it takes to string together `HEALTHY_RECOVERY_THRESHOLD`
-consecutive successes — a single success right after crossing the failure
-threshold does **not** clear the flag, and a failure partway through
-recovery resets the consecutive-success streak back to zero.
-
-Without this band, an endpoint whose success rate hovers right at the
-failure threshold would flip in and out of rotation on alternating
-requests (a "flapping" endpoint), which is disruptive both to the endpoint
-itself and to callers depending on consistent routing behavior. Requiring
-several consecutive successes before re-admission smooths this out at the
-cost of a short delay before a genuinely recovered endpoint sees traffic
-again.
 
 ## Delivery Integration
 

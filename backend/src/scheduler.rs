@@ -17,12 +17,9 @@ pub struct SchedulerContext {
     pub consensus: Arc<crate::consensus::NodeCache>,
     /// Prometheus-style counters exposed at `/metrics`.
     pub metrics: Arc<crate::metrics::Metrics>,
-    /// Shared incident store: conflicts and validation failures detected by
-    /// scheduled jobs are opened here the same way a manually-filed
-    /// incident would be.
+    /// Shared incident store: consensus conflicts detected by the scheduled
+    /// job are opened here the same way a manually-filed incident would be.
     pub incident_state: Arc<crate::incidents::IncidentState>,
-    /// Expected checksums recorded per backup at creation time (#375).
-    pub backup_metadata_store: crate::backup_validation::BackupMetadataStore,
 }
 
 /// Polls preferences every minute and fires reminders for vaults whose TTL
@@ -36,7 +33,6 @@ pub async fn run(ctx: SchedulerContext) {
         consensus,
         metrics,
         incident_state,
-        backup_metadata_store,
     } = ctx;
 
     // Seed default secret rotation policies on startup.
@@ -46,7 +42,6 @@ pub async fn run(ctx: SchedulerContext) {
     // Track when we last ran the daily/hourly/periodic tasks.
     let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
     let mut last_rotation_check = chrono::DateTime::<Utc>::MIN_UTC;
-    let mut last_backup_validation = chrono::DateTime::<Utc>::MIN_UTC;
     let mut last_consensus_check = chrono::DateTime::<Utc>::MIN_UTC;
 
     loop {
@@ -139,13 +134,7 @@ pub async fn run(ctx: SchedulerContext) {
             last_rotation_check = now;
         }
 
-        // 5) Backup checksum validation (runs at most once every hour).
-        if now.signed_duration_since(last_backup_validation).num_minutes() >= 60 {
-            run_backup_validation_job(&backup_metadata_store, &incident_state);
-            last_backup_validation = now;
-        }
-
-        // 6) Distributed cache consensus reconciliation (#373; runs at most
+        // 5) Distributed cache consensus reconciliation (#373; runs at most
         //    once every 5 minutes — cache drift needs tighter reconciliation
         //    than the once-a-day/hour housekeeping jobs above).
         if now.signed_duration_since(last_consensus_check).num_minutes() >= 5 {
@@ -224,23 +213,16 @@ fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_left: u3
     tracing::info!(vault_id, ?channel, hours_left, "sending reminder");
 }
 
-// ── #81 / #375: Backup Validation Job ────────────────────────────────────────
+// ── #81: Backup Validation Job ───────────────────────────────────────────────
 
-/// Run the periodic backup checksum validation job.
+/// Run the periodic backup validation job.
 ///
 /// In a real deployment this would retrieve backup snapshots from durable
-/// storage and validate each one against the checksum recorded for it at
-/// creation time (`BackupValidator::register_backup`). Here we log a
-/// scheduled-run notice and validate whatever backups are currently known
-/// to `backup_metadata_store`'s owning storage layer; until a real backup
-/// storage adapter is wired up, that list is simulated as empty so the job
-/// framework (including the failure-alerting path) is exercised without
-/// requiring an external storage integration.
-fn run_backup_validation_job(
-    backup_metadata_store: &crate::backup_validation::BackupMetadataStore,
-    incident_state: &Arc<crate::incidents::IncidentState>,
-) {
-    use crate::backup_validation::{BackupValidator, ChecksumStatus};
+/// storage and validate each one.  Here we log a scheduled-run notice and
+/// simulate a trivial no-op validation so the job framework is exercised
+/// without requiring an external storage integration.
+fn run_backup_validation_job() {
+    use crate::backup_validation::BackupValidator;
     use chrono::Utc;
 
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -255,7 +237,7 @@ fn run_backup_validation_job(
     // Simulate validating a placeholder backup so the code path is exercised.
     // Replace with real backup retrieval when storage integration is ready.
     let placeholder_backups: Vec<(String, Vec<u8>)> = vec![];
-    let results = BackupValidator::validate_all_backups(backup_metadata_store, &placeholder_backups);
+    let results = BackupValidator::validate_all_backups(&placeholder_backups);
 
     for result in &results {
         if result.valid {
@@ -263,26 +245,11 @@ fn run_backup_validation_job(
                 backup_id = %result.backup_id,
                 "backup validation passed"
             );
-            continue;
-        }
-
-        tracing::warn!(
-            backup_id = %result.backup_id,
-            error = ?result.error,
-            "backup validation failed"
-        );
-
-        if matches!(result.checksum_status, ChecksumStatus::Mismatch { .. }) {
-            crate::incidents::open_incident(
-                &incident_state.store,
-                "Backup checksum mismatch detected",
-                format!(
-                    "Scheduled backup validation job {job_id} found a checksum mismatch for \
-                     backup '{}': {}",
-                    result.backup_id,
-                    result.error.clone().unwrap_or_default()
-                ),
-                crate::incidents::IncidentSeverity::Sev2,
+        } else {
+            tracing::warn!(
+                backup_id = %result.backup_id,
+                error = ?result.error,
+                "backup validation failed"
             );
         }
     }
@@ -297,7 +264,6 @@ fn run_backup_validation_job(
 // ── #83: Consistency Check Job ───────────────────────────────────────────────
 
 /// Run the periodic data consistency verification job.
-#[allow(dead_code)]
 fn run_consistency_check(db: &Arc<Db>) {
     use crate::consistency::ConsistencyChecker;
 
@@ -469,28 +435,6 @@ mod tests {
 
         assert_eq!(metrics.consensus_consistent.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.consensus_conflicts_total.load(Ordering::Relaxed), 0);
-        assert!(incident_state.store.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn backup_validation_job_runs_without_error_when_no_backups_are_available() {
-        // The scheduled job currently iterates a storage-provided backup
-        // list that is simulated as empty until a real storage adapter is
-        // wired up (see the doc comment on `run_backup_validation_job`), so
-        // this just pins that it's a safe no-op rather than a panic. The
-        // checksum-mismatch → incident alerting path this job shares with
-        // `POST /admin/validate-backup` is exercised directly (without the
-        // scheduler wrapper) in `backup_validation::tests` and
-        // `routes` integration tests.
-        use crate::backup_validation::create_metadata_store;
-
-        let store = create_metadata_store();
-        let incident_state = Arc::new(IncidentState {
-            store: create_incident_store(),
-        });
-
-        run_backup_validation_job(&store, &incident_state);
-
         assert!(incident_state.store.lock().unwrap().is_empty());
     }
 }

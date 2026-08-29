@@ -86,15 +86,10 @@ pub struct AppState {
     pub query_cache: Arc<crate::query_cache::QueryCache>,
     /// Distributed-lock deadlock detector stats (#82).
     pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
-    /// Incident tracking: shared by the incident HTTP API, scheduled
-    /// consensus reconciliation, backup checksum verification, and DR
-    /// runbook automation, so all of them surface problems the same way.
+    /// Incident tracking: shared by the incident HTTP API and the scheduled
+    /// consensus reconciliation job (#373), so a conflict opens the same
+    /// kind of record a manually-filed incident would.
     pub incident_state: Arc<crate::incidents::IncidentState>,
-    /// Expected checksums recorded per backup at creation time (#375).
-    pub backup_metadata_store: crate::backup_validation::BackupMetadataStore,
-    /// Disaster-recovery runbook automation state: confirmation tokens and
-    /// action history (#376).
-    pub dr_automation_state: Arc<crate::dr_automation::DrAutomationState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -136,12 +131,6 @@ impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
     fn from_ref(state: &AppState) -> Arc<crate::incidents::IncidentState> {
         Arc::clone(&state.incident_state)
-    }
-}
-
-impl axum::extract::FromRef<AppState> for Arc<crate::health_routing::HealthRoutingState> {
-    fn from_ref(state: &AppState) -> Arc<crate::health_routing::HealthRoutingState> {
-        Arc::clone(&state.webhook_state.health_routing_state)
     }
 }
 

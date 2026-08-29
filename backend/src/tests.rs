@@ -13,7 +13,6 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
-    backup_validation::create_metadata_store,
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
@@ -21,7 +20,6 @@ use ethos_protocol_backend::{
         create_vault_store, Db, PoolConfig,
     },
     degradation::DegradationState,
-    dr_automation::DrAutomationState,
     event_sourcing::EventSourcingState,
     feature_flags::FlagState,
     graphql::build_schema,
@@ -98,8 +96,6 @@ fn test_state(db: Arc<Db>) -> AppState {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
-        backup_metadata_store: create_metadata_store(),
-        dr_automation_state: Arc::new(DrAutomationState::new()),
     }
 }
 
@@ -386,8 +382,6 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
-        backup_metadata_store: create_metadata_store(),
-        dr_automation_state: Arc::new(DrAutomationState::new()),
     };
     db.migrate().unwrap();
 
