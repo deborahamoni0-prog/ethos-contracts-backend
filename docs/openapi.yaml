@@ -37,6 +37,14 @@ tags:
     description: Backup and recovery operations
   - name: Release Simulator
     description: Project vault release dates under different check-in behaviour scenarios
+  - name: Time-Series
+    description: Time-series data ingestion, querying, compression, retention, and benchmarking (#75)
+  - name: Bulk Jobs
+    description: Async bulk operation queuing, progress tracking, and result retrieval (#74)
+  - name: Cost Estimation
+    description: Pre-flight Stellar/Soroban operation cost estimation (#72)
+  - name: Request Replay
+    description: API request replay for debugging and regression testing (#73)
 
 paths:
   /health:
@@ -802,8 +810,890 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  # ── Time-Series Data Optimizations (#75) ──────────────────────────────────
+
+  /timeseries/ingest:
+    post:
+      summary: Ingest a time-series data point
+      description: Store a single metric data point in the time-series engine. Data is automatically routed to a monthly partition for the given series.
+      operationId: ingestTimeSeriesPoint
+      tags:
+        - Time-Series
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+      responses:
+        '204':
+          description: Point ingested successfully
+        '400':
+          description: Invalid request body
+
+  /timeseries/query:
+    post:
+      summary: Query time-series data
+      description: Retrieve data points for a series, optionally downsampled to hourly, daily, or weekly resolution.
+      operationId: queryTimeSeries
+      tags:
+        - Time-Series
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeSeriesQueryRequest'
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeSeriesQueryResponse'
+
+  /timeseries/{series}/compress:
+    post:
+      summary: Compress all partitions for a series
+      description: Apply lossy compression (value rounding to 4dp) to all uncompressed partitions. Returns bytes saved.
+      operationId: compressTimeSeries
+      tags:
+        - Time-Series
+      parameters:
+        - name: series
+          in: path
+          required: true
+          schema:
+            type: string
+          example: vault.balance
+      responses:
+        '200':
+          description: Compression result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompressResponse'
+
+  /timeseries/{series}/retention:
+    post:
+      summary: Set retention policy for a series
+      description: Configure how long raw, hourly, and daily data is retained before automatic pruning.
+      operationId: setRetentionPolicy
+      tags:
+        - Time-Series
+      parameters:
+        - name: series
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetRetentionRequest'
+      responses:
+        '200':
+          description: Applied retention policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetentionPolicy'
+
+  /timeseries/{series}/benchmark:
+    post:
+      summary: Benchmark storage for a series
+      description: Run a full storage benchmark — measures raw bytes, compression savings, and downsampled counts.
+      operationId: benchmarkTimeSeries
+      tags:
+        - Time-Series
+      parameters:
+        - name: series
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Benchmark result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenchmarkResult'
+
+  # ── Bulk Operation Queuing (#74) ───────────────────────────────────────────
+
+  /jobs:
+    post:
+      summary: Submit a bulk operation job
+      description: Enqueue an async bulk operation (e.g., update TTL for multiple vaults, send reminders). Returns immediately with a job ID for status polling.
+      operationId: createBulkJob
+      tags:
+        - Bulk Jobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+      responses:
+        '202':
+          description: Job accepted and queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateJobResponse'
+        '400':
+          description: Invalid request (empty items list)
+    get:
+      summary: List all bulk jobs
+      description: Returns all jobs ordered by creation time (newest first). Filter by status with the `status` query parameter.
+      operationId: listBulkJobs
+      tags:
+        - Bulk Jobs
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+      responses:
+        '200':
+          description: List of jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BulkJob'
+
+  /jobs/{job_id}:
+    get:
+      summary: Get job status and progress
+      description: Returns detailed status, progress percentage, and estimated time remaining for a job.
+      operationId: getBulkJob
+      tags:
+        - Bulk Jobs
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
+        '404':
+          description: Job not found
+    delete:
+      summary: Cancel a job
+      description: Cancel a queued or running job. Completed or failed jobs cannot be cancelled.
+      operationId: cancelBulkJob
+      tags:
+        - Bulk Jobs
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Job cancelled
+        '404':
+          description: Job not found or not cancellable
+
+  # ── Request Cost Estimation (#72) ─────────────────────────────────────────
+
+  /estimate-cost:
+    post:
+      summary: Estimate operation cost
+      description: |
+        Returns a detailed fee breakdown for a Stellar/Soroban operation before it is submitted.
+        Fees are in stroops (1 XLM = 10,000,000 stroops).
+
+        **Cost factors documented at** `/docs/cost-estimation`.
+      operationId: estimateCost
+      tags:
+        - Cost Estimation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EstimateCostRequest'
+            examples:
+              check_in:
+                summary: Estimate a vault check-in
+                value:
+                  operation: check_in
+              bulk_check_in:
+                summary: Estimate bulk check-in for 50 vaults with scenarios
+                value:
+                  operation: bulk_check_in
+                  bulk_count: 50
+                  include_scenarios: true
+      responses:
+        '200':
+          description: Cost breakdown
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EstimateCostResponse'
+
+  # ── API Request Replay Capability (#73) ───────────────────────────────────
+
+  /replay:
+    post:
+      summary: Replay a logged API request
+      description: |
+        Re-execute a previously recorded API request. Supports conditional replay (only replay
+        if the original had a specific status, path substring, or body value) and optional
+        response comparison to detect drift.
+
+        **Admin endpoint** — restrict access in production.
+      operationId: replayRequest
+      tags:
+        - Request Replay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplayRequest'
+      responses:
+        '200':
+          description: Replay result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayResult'
+        '404':
+          description: Log entry not found
+
+  /replay/batch:
+    post:
+      summary: Batch replay multiple logged requests
+      description: Replay up to 50 logged requests in one call. Returns per-request outcomes and a summary (identical/diverged/skipped counts).
+      operationId: batchReplay
+      tags:
+        - Request Replay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchReplayRequest'
+      responses:
+        '200':
+          description: Batch replay results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchReplayResponse'
+        '400':
+          description: Empty list or more than 50 entries
+
+  /replay/logs:
+    get:
+      summary: List stored request logs
+      description: Returns stored request/response logs, newest first. Filterable by path prefix.
+      operationId: listRequestLogs
+      tags:
+        - Request Replay
+      parameters:
+        - name: path
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by URL path prefix (e.g. `/api/vaults`)
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+      responses:
+        '200':
+          description: List of request logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RequestLog'
+
+  /replay/logs/{log_id}:
+    get:
+      summary: Get a single request log entry
+      operationId: getRequestLog
+      tags:
+        - Request Replay
+      parameters:
+        - name: log_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Request log entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestLog'
+        '404':
+          description: Log entry not found
+
 components:
   schemas:
+    # ── Time-Series schemas ────────────────────────────────────────────────
+
+    IngestRequest:
+      type: object
+      properties:
+        series:
+          type: string
+          description: Series name (e.g. vault.balance, check_in.count)
+          example: vault.balance
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp (defaults to now)
+        value:
+          type: number
+          format: double
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+      required:
+        - series
+        - value
+
+    TimeSeriesQueryRequest:
+      type: object
+      properties:
+        series:
+          type: string
+        resolution:
+          type: string
+          enum: [raw, hourly, daily, weekly]
+          default: raw
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+      required:
+        - series
+
+    TimeSeriesQueryResponse:
+      type: object
+      properties:
+        series:
+          type: string
+        resolution:
+          type: string
+          enum: [raw, hourly, daily, weekly]
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/TSPoint'
+        count:
+          type: integer
+      required:
+        - series
+        - resolution
+        - points
+        - count
+
+    TSPoint:
+      type: object
+      properties:
+        series:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        value:
+          type: number
+          format: double
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+      required:
+        - series
+        - timestamp
+        - value
+
+    CompressResponse:
+      type: object
+      properties:
+        series:
+          type: string
+        bytes_saved:
+          type: integer
+        partitions_compressed:
+          type: integer
+      required:
+        - series
+        - bytes_saved
+        - partitions_compressed
+
+    SetRetentionRequest:
+      type: object
+      properties:
+        raw_retention_days:
+          type: integer
+          minimum: 1
+          description: Days to keep raw data
+        hourly_retention_days:
+          type: integer
+          description: Days to keep hourly downsampled data (0 = disabled)
+        daily_retention_days:
+          type: integer
+          description: Days to keep daily downsampled data (0 = disabled)
+      required:
+        - raw_retention_days
+
+    RetentionPolicy:
+      type: object
+      properties:
+        series:
+          type: string
+        raw_retention_days:
+          type: integer
+        hourly_retention_days:
+          type: integer
+        daily_retention_days:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - series
+        - raw_retention_days
+        - hourly_retention_days
+        - daily_retention_days
+
+    BenchmarkResult:
+      type: object
+      properties:
+        series:
+          type: string
+        raw_point_count:
+          type: integer
+        raw_bytes:
+          type: integer
+        compressed_bytes:
+          type: integer
+        compression_ratio:
+          type: number
+          format: double
+        downsampled_hourly_count:
+          type: integer
+        downsampled_daily_count:
+          type: integer
+        partitions_created:
+          type: integer
+        points_pruned_by_retention:
+          type: integer
+        benchmark_ran_at:
+          type: string
+          format: date-time
+      required:
+        - series
+        - raw_point_count
+        - compression_ratio
+
+    # ── Bulk Job schemas ───────────────────────────────────────────────────
+
+    BulkOperationType:
+      type: string
+      enum: [update_ttl, send_reminders, export_vaults, retention_sweep, custom]
+
+    JobStatus:
+      type: string
+      enum: [queued, running, completed, failed, cancelled]
+
+    BulkJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        operation:
+          $ref: '#/components/schemas/BulkOperationType'
+        payload:
+          description: Input data supplied at job creation
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Completion percentage
+        total_items:
+          type: integer
+        processed_items:
+          type: integer
+        failed_items:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        result:
+          nullable: true
+          description: Structured result (available when completed)
+        error:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+      required:
+        - id
+        - operation
+        - status
+        - progress
+        - total_items
+
+    CreateJobRequest:
+      type: object
+      properties:
+        operation:
+          $ref: '#/components/schemas/BulkOperationType'
+        items:
+          description: Array of items to process (e.g. vault IDs for update_ttl)
+          example: ["vault-1", "vault-2", "vault-3"]
+        label:
+          type: string
+          description: Optional human-readable label for this job
+      required:
+        - operation
+        - items
+
+    CreateJobResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        message:
+          type: string
+      required:
+        - job_id
+        - status
+        - message
+
+    JobStatusResponse:
+      type: object
+      properties:
+        job:
+          $ref: '#/components/schemas/BulkJob'
+        estimated_seconds_remaining:
+          type: integer
+          nullable: true
+          description: Linear extrapolation of seconds until completion
+      required:
+        - job
+
+    # ── Cost Estimation schemas ────────────────────────────────────────────
+
+    EstimateCostRequest:
+      type: object
+      properties:
+        operation:
+          type: string
+          enum: [create_vault, check_in, deposit, withdraw, trigger_release, update_beneficiary, bulk_check_in, custom]
+        vault_id:
+          type: string
+          nullable: true
+          description: Optional vault ID for vault-specific estimation
+        amount_stroops:
+          type: integer
+          format: int64
+          nullable: true
+          description: Amount in stroops for deposit/withdraw operations
+        bulk_count:
+          type: integer
+          format: int64
+          nullable: true
+          description: Number of vaults for bulk_check_in
+        payload_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Payload size in bytes for custom operations
+        include_scenarios:
+          type: boolean
+          default: false
+          description: Include scenario variants in the response
+      required:
+        - operation
+
+    CostBreakdown:
+      type: object
+      properties:
+        base_fee_stroops:
+          type: integer
+          format: int64
+        instruction_fee_stroops:
+          type: integer
+          format: int64
+        write_entries_fee_stroops:
+          type: integer
+          format: int64
+        read_entries_fee_stroops:
+          type: integer
+          format: int64
+        rent_fee_stroops:
+          type: integer
+          format: int64
+        total_stroops:
+          type: integer
+          format: int64
+        total_xlm:
+          type: number
+          format: double
+          description: Total cost in XLM (total_stroops / 10,000,000)
+        notes:
+          type: array
+          items:
+            type: string
+          description: Human-readable explanation of cost drivers
+      required:
+        - total_stroops
+        - total_xlm
+
+    EstimateCostResponse:
+      type: object
+      properties:
+        operation:
+          type: string
+        breakdown:
+          $ref: '#/components/schemas/CostBreakdown'
+        scenarios:
+          type: array
+          items:
+            $ref: '#/components/schemas/CostScenario'
+          description: Scenario variants (populated when include_scenarios=true)
+        estimated_at:
+          type: string
+          format: date-time
+        docs_url:
+          type: string
+          description: Link to cost factor documentation
+      required:
+        - operation
+        - breakdown
+        - estimated_at
+        - docs_url
+
+    CostScenario:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          type: object
+          additionalProperties: true
+        breakdown:
+          $ref: '#/components/schemas/CostBreakdown'
+      required:
+        - name
+        - description
+        - breakdown
+
+    # ── Request Replay schemas ─────────────────────────────────────────────
+
+    RequestLog:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        method:
+          type: string
+          enum: [GET, POST, PUT, DELETE, PATCH, OPTIONS]
+        path:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Request headers (Authorization stripped)
+        request_body:
+          nullable: true
+          description: Original request body
+        response_status:
+          type: integer
+        response_body:
+          description: Original response body
+        duration_ms:
+          type: integer
+          description: Original processing time in milliseconds
+        recorded_at:
+          type: string
+          format: date-time
+        tag:
+          type: string
+          nullable: true
+      required:
+        - id
+        - method
+        - path
+        - response_status
+        - recorded_at
+
+    ReplayCondition:
+      type: object
+      description: |
+        A condition that must be met before the replay executes.
+        Exactly one of the condition variants must be specified.
+      properties:
+        original_status_equals:
+          type: integer
+          description: Only replay if original status equals this code
+        path_contains:
+          type: string
+          description: Only replay if request path contains this substring
+        body_key_equals:
+          type: object
+          properties:
+            key:
+              type: string
+            value:
+              description: JSON value to match against
+          description: Only replay if request body has this key=value
+        always:
+          type: boolean
+          description: Always replay (default)
+
+    ReplayRequest:
+      type: object
+      properties:
+        log_id:
+          type: string
+          format: uuid
+          description: ID of the log entry to replay
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplayCondition'
+          description: Optional conditions — all must pass for the replay to proceed
+        validate:
+          type: boolean
+          default: true
+          description: Compare replayed response to original and report differences
+      required:
+        - log_id
+
+    ReplayOutcome:
+      type: string
+      enum: [identical, diverged, skipped, unvalidated]
+
+    ReplayResult:
+      type: object
+      properties:
+        log_id:
+          type: string
+          format: uuid
+        method:
+          type: string
+        path:
+          type: string
+        original_status:
+          type: integer
+        replayed_status:
+          type: integer
+        replayed_body:
+          description: Response body from the replay
+        outcome:
+          $ref: '#/components/schemas/ReplayOutcome'
+        diff_notes:
+          type: array
+          items:
+            type: string
+          description: Human-readable diff summary (populated when outcome is diverged)
+        replayed_at:
+          type: string
+          format: date-time
+      required:
+        - log_id
+        - outcome
+        - replayed_at
+
+    BatchReplayRequest:
+      type: object
+      properties:
+        log_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          maxItems: 50
+          description: IDs of log entries to replay
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplayCondition'
+        validate:
+          type: boolean
+          default: true
+      required:
+        - log_ids
+
+    BatchReplayResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplayResult'
+        total:
+          type: integer
+        identical:
+          type: integer
+        diverged:
+          type: integer
+        skipped:
+          type: integer
+      required:
+        - results
+        - total
+        - identical
+        - diverged
+        - skipped
+
     ErrorResponse:
       type: object
       properties:

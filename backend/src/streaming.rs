@@ -37,7 +37,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::stream;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{AppState, EventStore, VaultStore};
+use crate::db::AppState;
 use crate::models::{Vault, VaultEvent};
 
 // ── Cursor encoding ───────────────────────────────────────────────────────────
@@ -143,11 +143,7 @@ pub async fn stream_vaults(
     Query(query): Query<StreamQuery>,
 ) -> Response {
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(decode_cursor)
-        .unwrap_or(0);
+    let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
 
     let vaults_guard = state.vault_store.lock().unwrap();
     let filtered: Vec<Vault> = vaults_guard
@@ -192,11 +188,7 @@ pub async fn stream_events(
     Query(query): Query<StreamQuery>,
 ) -> Response {
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(decode_cursor)
-        .unwrap_or(0);
+    let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
 
     let events_guard = state.event_store.lock().unwrap();
     let filtered: Vec<VaultEvent> = events_guard

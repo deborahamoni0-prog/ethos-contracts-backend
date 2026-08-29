@@ -1,0 +1,85 @@
+# deny.toml — cargo-deny configuration (#102)
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Schema targets cargo-deny >=0.20 (the "v2" config): vulnerabilities are
+# always denied and can't be downgraded to a warning; `unmaintained`,
+# `unsound`, `notice`, and the old severity-level knobs for them were
+# removed outright. `ignore` below is the only way to accept a specific
+# advisory.
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+[advisories]
+# Ignored advisories — reviewed and accepted due to transitive SDK constraints.
+# Keep in sync with .cargo/audit.toml.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "`paste` (unmaintained) is pulled in transitively by soroban-wasmi." },
+    { id = "RUSTSEC-2026-0097", reason = "`rand` 0.8.5 (unsound only with a custom logger calling rand::rng(), which this codebase does not do) is pinned transitively by soroban-env-host/soroban-sdk." },
+]
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+[bans]
+# Block multiple versions of the same crate by default — helps catch
+# dependency confusion and reduces WASM binary bloat.
+multiple-versions = "warn"
+
+# Crates that must never appear in the dependency tree.
+deny = [
+    # Known-vulnerable / unmaintained crypto crates.
+    { crate = "rust-crypto" },
+    { crate = "openssl" },            # use rustls instead
+    { crate = "md-5" },               # MD5 is cryptographically broken
+]
+
+# Crates allowed to appear more than once (transitive SDK version conflicts).
+skip = [
+    # Soroban SDK pins older versions of several common crates.
+    { crate = "syn" },
+    { crate = "quote" },
+    { crate = "proc-macro2" },
+    { crate = "regex" },
+    { crate = "regex-syntax" },
+    { crate = "bitflags" },
+    { crate = "rand" },
+    { crate = "rand_core" },
+    { crate = "rand_chacha" },
+    { crate = "getrandom" },
+    { crate = "serde" },
+    { crate = "serde_derive" },
+    { crate = "indexmap" },
+    { crate = "hashbrown" },
+]
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+# Note: in the v2 schema, any license not in `allow` (or `exceptions`) below
+# is denied by default — there's no separate `deny` list or `default` level
+# to configure anymore.
+[licenses]
+# Allow the OSI-approved copyleft-free licenses common in the Rust ecosystem.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "0BSD",
+    "Zlib",
+    # Weak-copyleft/permissive licenses pulled in transitively by
+    # async-graphql's email-validation dependency (fast_chemail/ascii_utils).
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+# Threshold of confidence for license detection in crates without SPDX
+# identifiers (0.0–1.0).  0.8 is a good default.
+confidence-threshold = 0.8
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+[sources]
+# Allow crates from crates.io and our own git dependencies.
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

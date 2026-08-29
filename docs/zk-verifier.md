@@ -81,6 +81,14 @@ pub fn set_credential_privacy(env: Env, credential_id: u64, level: PrivacyLevel)
 /// Returns a credential's current PrivacyLevel (defaults to `Public`).
 pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel
 
+/// Returns the credential's current AttestationRecord (its attesting
+/// oracle and stable credential_id), gated on the caller's authorization
+/// under its PrivacyLevel. Unauthorized callers at Confidential receive a
+/// redacted record whose oracle field is masked out (recorded via
+/// MaskingConfig); unauthorized callers at Internal are denied with
+/// AccessDenied.
+pub fn get_attestation(env: Env, requester: Address, credential_id: u64) -> Option<AttestationRecord>
+
 /// Returns the credential's recorded state as of a specific version number
 /// (1-based, monotonically increasing, never reused), or `None` if that
 /// version was never recorded or has since been pruned. Same PrivacyLevel
@@ -114,6 +122,16 @@ pub fn get_credential_chain(env: Env, credential_id: u64) -> Vec<u64>
 /// Returns whether a credential and every one of its ancestors is
 /// currently valid (none invalidated by an upheld dispute).
 pub fn is_credential_chain_valid(env: Env, credential_id: u64) -> bool
+
+/// Returns whether the credential's scheduled consistency re-check is due
+/// (now >= next_check_due), publishing a `cons_due` event with
+/// (credential_id, next_check_due) when it is. Never-attested ids are never due.
+pub fn is_consistency_check_due(env: Env, credential_id: u64) -> bool
+
+/// Advances a credential's consistency-check window by one full
+/// CONSISTENCY_CHECK_INTERVAL from the current timestamp, after a completed
+/// re-check. Panics with CredentialNotFound if never attested. Anyone may call it.
+pub fn reschedule_consistency_check(env: Env, credential_id: u64)
 ```
 
 ### Current Verification Logic
@@ -148,6 +166,66 @@ The `verify_claim` function:
 | **Oracle Trust Model** | Attestations stored but not used | Malicious oracles can bypass checks |
 | **Claim Authentication** | Stored as SHA-256 digest only | No binding between claim and proof |
 | **Replay Protection** | None | Same proof/claim can be reused indefinitely |
+
+---
+
+## Lattice-Tagged Proofs & Field Masking
+
+`verify_lattice_proof` and `mask_proof_fields` are separate from the stub
+verification described above; this section documents what they actually do,
+since earlier revisions shipped them undocumented and, in `verify_lattice_proof`'s
+case, under a rustdoc comment calling it a "quantum-resistant" proof check.
+
+### `verify_lattice_proof`
+
+Despite the name, **this crate implements no lattice-based (e.g.
+Dilithium/Falcon-style, post-quantum) cryptographic scheme**, and
+`verify_lattice_proof` performs no such verification. What it actually does:
+
+1. Requires `proof` to carry the `LATTICE_V1` format header
+   (`LATTICE_PROOF_HEADER`) followed by a 4-byte checksum (the first 4 bytes
+   of `sha256` over everything before it) — see `is_valid_lattice_proof`.
+   This rejects accidental or naively-forged input; it is a structural tag,
+   not a proof of any mathematical statement.
+2. Requires the exact `proof` bytes to have been attested by a
+   currently-registered oracle for `claim` — the same oracle-attestation
+   trust model `verify_claim` uses. This is the actual trust boundary: a
+   `true` result means "a registered oracle vouched for these bytes,"
+   nothing more.
+
+If genuine post-quantum proof verification is ever needed, it requires a
+real lattice signature scheme (see "What a Real ZK Implementation
+Requires" below) — `verify_lattice_proof` is not a step toward that on its
+own, only a format tag on top of the existing oracle-attestation model.
+
+### `mask_proof_fields`
+
+Given `fields_to_mask` (byte offsets into `proof`, each `< 32` and `<
+proof.len()`), returns `b"MASKED_V1" || field_mask (u32 LE) || proof` with
+every masked offset's byte zeroed out. The output does not contain the
+original byte at any masked offset — inspecting it does not recover masked
+data. `verify_masked_proof` then checks the *masked* output against oracle
+attestation, exactly like `verify_claim`.
+
+### Additional error codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 17 | InvalidLatticeProof | `proof` does not carry a valid LATTICE_V1 header + checksum |
+| 18 | ExternalFormatTooLarge | Exported/masked proof format exceeds MAX_EXTERNAL_FORMAT_SIZE (8 KB) |
+| 19 | InvalidMaskSpec | `fields_to_mask` was empty, referenced an out-of-range offset, or `masked_proof` was too short |
+| 20 | MaskedVerificationFailed | The masked proof was not attested by a currently-registered oracle |
+
+> **Note on this document's other error codes:** the table below (and the
+> Credential Dispute Resolution / Temporal Queries / Version History /
+> Hierarchies / Privacy Levels sections that follow) describe a larger
+> public API — `initiate_credential_dispute`, `vote_on_dispute`,
+> `get_credential_at_time`, `get_credential_parent`,
+> `is_credential_chain_valid`, and related functions — that is **not
+> present in `src/lib.rs`** as of this revision. That gap predates and is
+> unrelated to the lattice/masking fix described above (`src/test.rs` has
+> pre-existing compile errors referencing the same missing API); reconciling
+> it is a separate, larger effort than this document's scope here covers.
 
 ---
 
@@ -432,16 +510,87 @@ let snapshot = client.get_credential_at_time(&requester, &1u64, &timestamp);
 `set_credential_privacy` panics with `CredentialNotFound` (#8) if
 `credential_id` was never attested, mirroring `initiate_credential_dispute`.
 
+### Attestation query path (`get_attestation`)
+
+The credential-level gating above also applies to the attestation query
+path itself: `get_attestation(requester, credential_id)` returns the
+credential's current `AttestationRecord` — the attesting oracle and its
+stable `credential_id`. `requester` must authorize the call (so the
+caller cannot be spoofed) and must satisfy the credential's
+`PrivacyLevel`:
+
+| PrivacyLevel | Authorized callers | Unauthorized callers |
+|--------------|--------------------|----------------------|
+| `Public` | anyone | — (everyone is authorized) |
+| `Internal` | admin, any registered oracle | panics with `AccessDenied` (#21) |
+| `Confidential` | admin | receive a **redacted** record |
+
+At `Confidential`, an unauthorized caller is *not* denied outright —
+denying would itself confirm the credential exists. Instead the caller
+receives a redacted `AttestationRecord` whose `oracle` field is masked
+out (replaced with the all-zero Ed25519 account
+`GAAAA...WHF`, a strkey that is not a usable Stellar account and so can
+never be mistaken for a genuine attesting oracle), while `credential_id`
+is kept so the record still identifies itself. The redaction is recorded
+on-chain in a `MaskingConfig` — the same type `mask_proof_fields` uses
+for proof-field masking — stored under `DataKey::AttestationMasking`
+keyed by the credential, so exactly what was masked remains auditable.
+
+> **Terminology note:** this enforcement model is the "Public /
+> Restricted / Private" model by another name — the codebase calls the
+> middle tier `Internal` and the most restrictive tier `Confidential`.
+> "Restricted" readers are the admin and registered oracles; "Private"
+> records are readable in full only by the admin and are redacted for
+> everyone else.
+
 ### What this does and does not cover
 
-Privacy filtering applies to `get_credential_at_time`, `get_credential_version`,
-and `diff_credential_versions` — every query that exposes a credential's full
+Privacy filtering applies to `get_attestation` (the attestation query
+path) and, once the temporal-query API described above is restored, to
+`get_credential_at_time`, `get_credential_version`, and
+`diff_credential_versions` — every query that exposes a credential's full
 attestation state (oracle, invalidated flag, timestamp). It intentionally
 does **not** gate `verify_claim`: that call
 already requires the caller to possess the exact `proof` and `claim` bytes,
 so it authenticates via knowledge of the secret rather than identity, and
 restricting it further would not add confidentiality — only availability
 loss for legitimate holders of a confidential credential's proof.
+
+---
+
+## Scheduled Consistency Re-Checks
+
+`verify_credentials_consistent` (and `CredentialRegistry` in
+`src/consistency.rs`) provides on-demand consistency verification, but until
+this feature there was no way to schedule periodic re-checks for long-lived
+attestations. Every attestation now tracks a `next_check_due` timestamp:
+
+- **Scheduling**: `attest` and `create_derived_credential` set
+  `next_check_due` to the attestation time plus `CONSISTENCY_CHECK_INTERVAL`
+  (30 days). Re-attesting an existing `(proof, claim)` pair refreshes the
+  schedule.
+- **Detection**: `is_consistency_check_due(credential_id)` returns `true`
+  once the ledger timestamp is at or past `next_check_due`. When due it also
+  publishes a `cons_due` event with `(credential_id, next_check_due)` so
+  off-chain workers can pick the credential up for re-verification (e.g. via
+  `verify_credentials_consistent`). Unknown credential ids are never due
+  (absence means no schedule), mirroring `is_credential_invalidated`.
+- **Periodicity**: a due check stays due until an off-chain worker completes
+  the re-check and calls `reschedule_consistency_check(credential_id)`, which
+  pushes the next window out by one full `CONSISTENCY_CHECK_INTERVAL` from
+  the current timestamp. Anyone may call it — it only moves a timer forward.
+  Without this step the check would be due-once-and-forever instead of
+  periodic.
+
+Note: because publishing an event requires a real transaction, off-chain
+workers must *invoke* `is_consistency_check_due` (not view-call it) for the
+`cons_due` event to be recorded; the boolean result is available either way.
+
+Adding `next_check_due` to the stored `AttestationRecord` changes its XDR
+layout, so attestation records persisted by an older contract version would
+fail to decode — in this stub's lifecycle that only matters for contracts
+that were already deployed before the field existed, and is resolved by
+re-attestation (which rewrites the record with a fresh schedule).
 
 ---
 
@@ -676,6 +825,19 @@ fn test_oracle_attestation_flow() {
 ---
 
 ## Error Codes
+
+> **Numbering note:** this table documents the full API described in this
+> document, some of which is not yet present in `src/lib.rs` (see the
+> note above the "Additional error codes" section). In the current
+> `src/lib.rs`, `AccessDenied` is error **21** — not 16 as listed below —
+> because the current error numbering differs from the documented API:
+> the hierarchy errors are 12-16 (`CredentialNotFound` 12,
+> `SelfReferentialParent` 13, `ParentAlreadySet` 14,
+> `CredentialChainTooDeep` 15, `ParentCredentialInvalid` 16), the
+> lattice/masking errors are 17-20 (see "Additional error codes" above),
+> and `AccessDenied` is 21. Codes 8-11 and `VersionNotFound` (17 below)
+> belong to the dispute / version-history API that is not yet present in
+> `src/lib.rs`.
 
 | Code | Name | Description |
 |------|------|-------------|

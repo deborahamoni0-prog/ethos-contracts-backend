@@ -5,7 +5,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Symbol};
 /// Bumping this constant does not retroactively upgrade existing SBTs —
 /// callers must invoke `migrate_sbt_metadata` explicitly. See that function's
 /// docs for the migration strategy.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// Schema version when metadata compression was introduced.
+pub const COMPRESSION_SCHEMA_VERSION: u32 = 3;
 
 pub const MAX_METADATA_SIZE: u32 = 4096;
 pub const MAX_IDENTITY_PROOF_SIZE: u32 = 4096;

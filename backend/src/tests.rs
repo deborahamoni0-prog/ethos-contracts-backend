@@ -13,16 +13,49 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
+    batching::{AdaptiveBatcher, BatchConfig},
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, Db, PoolConfig,
     },
+    degradation::DegradationState,
+    event_sourcing::EventSourcingState,
+    feature_flags::FlagState,
     graphql::build_schema,
+    load_shedding::{LoadMonitor, LoadShedder, SheddingConfig},
+    message_queue::MessageQueueState,
+    metrics::Metrics,
+    predictive_scaling::{ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig},
+    priority::{PriorityConfig, PriorityEnforcer},
     routes,
     webhook::WebhookState,
     AppState,
 };
+
+fn test_scaling_state() -> (
+    Arc<Metrics>,
+    Arc<PriorityEnforcer>,
+    Arc<LoadShedder>,
+    Arc<AdaptiveBatcher>,
+    Arc<PredictiveScaler>,
+) {
+    (
+        Metrics::new(),
+        Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
+        Arc::new(LoadShedder::new(
+            LoadMonitor::new(),
+            SheddingConfig::default(),
+        )),
+        Arc::new(AdaptiveBatcher::new(BatchConfig::default())),
+        Arc::new(PredictiveScaler::new(
+            10,
+            ForecastModel::default(),
+            ScalingConfig::default(),
+            Box::new(LoggingAutoscalerClient),
+        )),
+    )
+}
 
 fn test_state(db: Arc<Db>) -> AppState {
     db.migrate().unwrap();
@@ -35,8 +68,11 @@ fn test_state(db: Arc<Db>) -> AppState {
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
+    let (metrics, priority_enforcer, load_shedder, batcher, scaler) = test_scaling_state();
+    let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+    let degradation_state = Arc::new(DegradationState::new(Arc::clone(&db)));
     AppState {
-        db,
+        db: Arc::clone(&db),
         vault_store,
         event_store,
         audit_store: create_audit_store(),
@@ -45,6 +81,19 @@ fn test_state(db: Arc<Db>) -> AppState {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
+        event_sourcing: Arc::new(EventSourcingState::with_db(Arc::clone(&db))),
+        message_queue: Arc::new(
+            MessageQueueState::new().expect("failed to initialize message queue"),
+        ),
+        degradation_state,
+        flag_state,
+        query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
+        deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     }
 }
 
@@ -304,6 +353,9 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         version: 1,
     });
 
+    let (metrics, priority_enforcer, load_shedder, batcher, scaler) = test_scaling_state();
+    let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+    let degradation_state = Arc::new(DegradationState::new(Arc::clone(&db)));
     let state = AppState {
         db: Arc::clone(&db),
         vault_store: create_vault_store(),
@@ -314,6 +366,19 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
+        event_sourcing: Arc::new(EventSourcingState::with_db(Arc::clone(&db))),
+        message_queue: Arc::new(
+            MessageQueueState::new().expect("failed to initialize message queue"),
+        ),
+        degradation_state,
+        flag_state,
+        query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
+        deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     };
     db.migrate().unwrap();
 

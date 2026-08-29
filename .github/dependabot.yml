@@ -16,6 +16,18 @@ updates:
       prefix: "chore(deps):"
     allow:
       - dependency-type: "all"
+    groups:
+      # Security advisories: include minor bumps so patched versions are picked up
+      security-patches:
+        applies-to: security-updates
+        update-types:
+          - "patch"
+          - "minor"
+      # Routine version updates: patch-only to minimise breaking-change risk
+      regular-updates:
+        applies-to: version-updates
+        update-types:
+          - "patch"
 
   - package-ecosystem: github-actions
     directory: "/"
@@ -31,3 +43,9 @@ updates:
       - ci
     commit-message:
       prefix: "ci(deps):"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

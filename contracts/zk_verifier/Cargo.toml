@@ -2,12 +2,17 @@
 name = "zk-verifier"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [lints]
 workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# "rlib" (alongside the on-chain "cdylib") lets `tests/` integration tests
+# link against the crate. Needed because `src/test.rs`'s unit tests are
+# pre-existing broken (see tests/lattice_and_masking.rs for why the new
+# tests for this fix live there instead).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }

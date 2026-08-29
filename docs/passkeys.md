@@ -146,3 +146,44 @@ Owners should monitor for this event and rotate or revoke suspected passkeys.
 |---|---|---|
 | `pk_expd` | `passkey_hash` | Expired passkey used in check-in |
 | `pk_comp` | `(vault_id, passkey_hash)` | Compromise detected or reported |
+
+## On-chain Log Bounds and Full History (Issue fix)
+
+### Bounded on-chain storage
+
+Both the passkey usage log (`PasskeyUsage`) and the passkey audit log
+(`PasskeyAuditLog`) are **capped at 1 000 entries** per vault on-chain:
+
+| Log | Data key | Cap | Pruning strategy |
+|-----|----------|-----|-----------------|
+| Passkey usage | `PasskeyUsage(vault_id)` | 1 000 entries | Drop-oldest (index 0) |
+| Passkey audit | `PasskeyAuditLog(vault_id)` | 1 000 entries | Drop-oldest (index 0) |
+
+This matches the existing `timestamps.len() > 1000` snapshot cap applied
+elsewhere in the contract.  The cap is enforced *before* the write on every
+check-in / lifecycle operation, so storage size is strictly bounded regardless
+of how many years a vault is actively used.
+
+### Why the cap exists
+
+Every check-in appends to both Vecs and writes the entire serialized entry back
+to Soroban's persistent storage.  Without a cap, a long-lived vault that
+check-ins daily for several years would accumulate thousands of entries, risk
+exceeding Soroban's practical per-entry serialisation limit, and ultimately
+brick check-ins — triggering premature vault release.
+
+### Full history via events
+
+The cap is a **storage concern only**.  Every check-in and lifecycle operation
+continues to emit its event regardless of whether an on-chain entry was pruned:
+
+| Event topic | What it covers |
+|-------------|----------------|
+| `pk_usage`  | Every passkey check-in, forever |
+| `pk_audit`  | Every passkey add / remove / use lifecycle event, forever |
+
+Off-chain indexers (e.g. Horizon event streaming) receive the full unbounded
+event history.  The on-chain `get_passkey_usage` and `get_passkey_audit_log`
+queries return only the **most recent ≤ 1 000 entries**.  If your application
+needs the complete historical record, consume the event stream rather than
+querying on-chain storage directly.

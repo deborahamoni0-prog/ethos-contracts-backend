@@ -296,7 +296,7 @@ pub struct VaultEvent {
     pub data: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     CheckIn,
@@ -485,6 +485,14 @@ pub struct RestoreRequest {
     pub backup_id: String,
     /// The same key used during backup (base64-encoded 32-byte key)
     pub encryption_key: String,
+}
+
+/// Request body for `POST /admin/validate-backup` (#81): validate the
+/// integrity of a base64-encoded backup payload.
+#[derive(Debug, Deserialize)]
+pub struct BackupValidateRequest {
+    pub backup_id: String,
+    pub data_base64: String,
 }
 
 // ── Task 3: Sharing & Collaboration ──────────────────────────────────────────
@@ -920,4 +928,182 @@ pub struct FullTextSearchResponse {
     pub total: u32,
     pub facets: Vec<SearchFacet>,
     pub query_time_ms: u64,
+}
+
+// ── #100: Data Retention Policies ───────────────────────────────────────────
+
+/// Policy controlling how long a particular data type is kept before purging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRetentionPolicy {
+    /// Logical name of the data type (e.g. "audit_logs", "reminder_preferences").
+    pub data_type: String,
+    /// Number of days to retain records. 0 means retain forever.
+    pub retention_days: u32,
+    /// Whether the policy is actively enforced by the purge scheduler.
+    pub enabled: bool,
+    /// Human-readable description of this policy.
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for creating or updating a retention policy.
+#[derive(Debug, Deserialize)]
+pub struct UpsertRetentionPolicyRequest {
+    pub retention_days: u32,
+    pub enabled: Option<bool>,
+    pub description: Option<String>,
+}
+
+/// A single entry in the deletion audit trail produced by the purge job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionDeletionLog {
+    pub id: i64,
+    pub data_type: String,
+    pub deleted_rows: u64,
+    pub purged_at: DateTime<Utc>,
+    /// "system" for automated purges, user ID for manual purges.
+    pub actor: String,
+    /// Optional JSON details about the purge run.
+    pub details: Option<serde_json::Value>,
+}
+
+/// An exception that exempts a specific record from normal retention purging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionException {
+    pub id: i64,
+    pub data_type: String,
+    /// Opaque identifier of the record being exempted.
+    pub record_id: String,
+    /// Business reason for the exemption.
+    pub reason: String,
+    /// When the exemption itself expires (None = permanent).
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
+}
+
+/// Request body for registering a retention exception.
+#[derive(Debug, Deserialize)]
+pub struct CreateRetentionExceptionRequest {
+    pub record_id: String,
+    pub reason: String,
+    /// Seconds until this exemption expires. None = permanent.
+    pub expires_in_seconds: Option<u64>,
+}
+
+/// Response returned after running a manual purge.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PurgeRunResult {
+    pub data_type: String,
+    pub deleted_rows: u64,
+    pub purged_at: DateTime<Utc>,
+}
+
+// ── #101: Encrypted Field Storage ───────────────────────────────────────────
+
+/// A field value stored after AES-256-GCM encryption.
+/// The ciphertext and nonce are base64-encoded for safe serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedField {
+    /// Base64-encoded AES-256-GCM ciphertext.
+    pub ciphertext: String,
+    /// Base64-encoded 12-byte nonce used for this encryption.
+    pub nonce: String,
+    /// Key version used to encrypt this field (supports rotation).
+    pub key_version: u32,
+}
+
+/// Metadata about an active or retired encryption key version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionKeyInfo {
+    pub version: u32,
+    pub status: EncryptionKeyStatus,
+    pub created_at: DateTime<Utc>,
+    /// When this key was rotated out (None if still active).
+    pub rotated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionKeyStatus {
+    Active,
+    /// Key is being phased out; still usable for decryption but not encryption.
+    Retiring,
+    Retired,
+}
+
+/// Summary of a key-rotation operation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyRotationResult {
+    pub previous_version: u32,
+    pub new_version: u32,
+    pub rotated_at: DateTime<Utc>,
+    /// Number of encrypted records re-encrypted with the new key.
+    pub records_re_encrypted: u64,
+}
+
+// ── #103: Secret Rotation Policy ────────────────────────────────────────────
+
+/// Categories of secrets managed by the rotation policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretType {
+    ApiKey,
+    DatabasePassword,
+    EncryptionKey,
+    JwtSecret,
+    WebhookSecret,
+    RemindersApiKey,
+}
+
+/// Rotation schedule configuration for a specific secret type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretRotationPolicy {
+    pub secret_type: SecretType,
+    /// How often this secret must be rotated (in days).
+    pub rotation_interval_days: u32,
+    /// Grace period (in hours) during which both old and new secrets are accepted.
+    pub grace_period_hours: u32,
+    /// Whether automated rotation is enabled.
+    pub auto_rotate: bool,
+    /// Notification channel(s) to alert when rotation is due / complete.
+    pub notify_channels: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for upserting a secret rotation policy.
+#[derive(Debug, Deserialize)]
+pub struct UpsertSecretRotationPolicyRequest {
+    pub rotation_interval_days: u32,
+    pub grace_period_hours: Option<u32>,
+    pub auto_rotate: Option<bool>,
+    pub notify_channels: Option<Vec<String>>,
+}
+
+/// A log entry recording that a secret was rotated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretRotationLog {
+    pub id: i64,
+    pub secret_type: SecretType,
+    pub rotated_at: DateTime<Utc>,
+    /// "system" for automated rotations, user ID for manual rotations.
+    pub actor: String,
+    /// Whether the grace period is still active.
+    pub grace_period_active: bool,
+    /// When the grace period ends (None if not applicable).
+    pub grace_period_ends_at: Option<DateTime<Utc>>,
+    pub notes: Option<String>,
+}
+
+/// Status summary for a secret type.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SecretRotationStatus {
+    pub secret_type: SecretType,
+    pub last_rotated_at: Option<DateTime<Utc>>,
+    pub next_rotation_due: Option<DateTime<Utc>>,
+    pub is_overdue: bool,
+    pub grace_period_active: bool,
+    pub grace_period_ends_at: Option<DateTime<Utc>>,
 }

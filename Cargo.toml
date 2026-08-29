@@ -2,6 +2,9 @@
 resolver = "2"
 members = ["contracts/ttl_vault", "contracts/zk_verifier", "contracts/sbt", "backend"]
 
+[workspace.package]
+license = "MIT"
+
 [workspace.lints.clippy]
 # Pedantic lints are enabled workspace-wide; CI promotes warnings to errors via
 # `cargo clippy -- -D warnings`. Selective allows below cover accepted patterns

@@ -470,7 +470,7 @@ let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
 ### Database Persistence
 
-By default, the backend uses an in-memory SQLite database (`:memory:`), which is cleared on restart.
+By default, the backend uses an in-memory SQLite database (`:memory:`), which is cleared on restart. This applies to all SQLite-backed tables, including `vaults`.
 
 **For persistent storage**, set:
 

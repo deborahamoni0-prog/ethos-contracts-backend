@@ -70,13 +70,16 @@ impl Metrics {
     }
 }
 
-fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
+/// Renders a Prometheus counter line. `pub(crate)` so the load shedding
+/// (#128), adaptive batching (#131) and predictive scaling (#130) modules
+/// can append their own metrics in the same exposition format.
+pub(crate) fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} counter");
     let _ = writeln!(out, "{name} {value}");
 }
 
-fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
+pub(crate) fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} gauge");
     let _ = writeln!(out, "{name} {value}");

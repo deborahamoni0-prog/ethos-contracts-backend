@@ -146,18 +146,39 @@ The script will display the target network and identity, then require you to typ
 
 ## 📖 Documentation
 
+### Learning Resources
+- [FAQ and Common Issues](docs/faq.md)
+- [Video Tutorials](docs/video-tutorials.md)
+- [Interactive Playground](docs/playground.md)
+- [Architecture Diagrams and Visual Guides](docs/architecture-diagrams.md)
+
+### Core Concepts
 - [Architecture Overview](docs/architecture.md)
 - [TTL & State Archival Logic](docs/ttl-logic.md)
 - [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+
+### Beneficiary Features
 - [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
 - [Beneficiary Conflict Resolution](docs/beneficiary-conflict-resolution.md)
-- [Withdrawal Features](docs/withdrawal-features.md)
-- [Threat Model & Security](docs/security.md)
-- [Security Policy & Vulnerability Disclosure](SECURITY.md)
-- [Roadmap](docs/roadmap.md)
-- [Vesting Schedules](docs/vesting-schedules.md)
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
+- [Vesting Schedules](docs/vesting-schedules.md)
+
+### Operations
+- [Withdrawal Features](docs/withdrawal-features.md)
+- [Deployment Guide](docs/deployment-guide.md)
+- [Monitoring Guide](docs/monitoring-guide.md)
+- [Disaster Recovery Runbook](docs/disaster-recovery-runbook.md)
+
+### Security
+- [Threat Model & Security](docs/security.md)
+- [Security Audit Checklist](docs/security-audit-checklist.md)
+- [Security Policy & Vulnerability Disclosure](SECURITY.md)
+
+### Reference
+- [API Reference](docs/api-reference.md)
+- [OpenAPI Specification](docs/openapi.yaml)
+- [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API
 
@@ -194,6 +215,33 @@ exit_hibernation(vault_id: u64, caller: Address)
 get_hibernation(vault_id: u64) -> Option<HibernationEntry>
 ```
 
+### Slice Failover (Issue #35)
+
+Protects slices from becoming single points of failure. The vault owner
+pre-registers backup slices; the contract auto-promotes a backup once the
+primary's failure count reaches a configured threshold.
+
+```rust
+// Owner-only: register backup and configure threshold
+register_backup_slice(vault_id, caller, primary_slice_id, backup_slice_id, failure_threshold) -> u64
+
+// Owner-only: record a failure and auto-promote backup when threshold is reached
+record_slice_failure(vault_id, caller, primary_slice_id, reason: FailoverReason) -> bool
+
+// Owner-only: force-promote backup without threshold
+activate_failover(vault_id, caller, primary_slice_id, backup_slice_id, reason) -> bool
+
+// Owner-only: restore primary and reset failure counter
+revert_failover(vault_id, caller, primary_slice_id, backup_slice_id) -> bool
+
+// Read-only queries (no auth required)
+get_backup_slices(primary_slice_id) -> Vec<u64>
+get_active_slice(slice_id) -> u64      // returns primary_id when healthy, backup_id when failed over
+get_failure_count(slice_id) -> u32
+```
+
+See [docs/slice-performance-and-rules-engine.md](docs/slice-performance-and-rules-engine.md) for full details.
+
 ## 🧪 Testing
 
 Comprehensive test suite covering:
@@ -203,6 +251,7 @@ Comprehensive test suite covering:
 ✅ TTL expiry and automatic release  
 ✅ Passkey authentication validation  
 ✅ Beneficiary payout execution  
+✅ Slice failover — authorized promotion and unauthorized rejection  
 ✅ Error handling and edge cases  
 
 Run tests:

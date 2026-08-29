@@ -1,39 +1,97 @@
 target/
 
-# Test snapshots
+# Test snapshots and fuzz artifacts
 **/__snapshots__/
 *.snap
 *.snap.new
 test_snapshots/
 *.proptest-regressions
+contracts/*/fuzz/corpus/
+contracts/*/fuzz/artifacts/
+fuzz/corpus/
+fuzz/artifacts/
 
-# Build artifacts
+# Test / coverage artifacts
+*.profraw
+*.profdata
+coverage/
+*.tmp
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
 *.wasm
 *.d
+*.o
+*.a
 
-# Environment files
+# ── Benchmark output ──────────────────────────────────────────────────────────
+criterion/
+
+# ── Environment files ─────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
+.env.production
 
-# Local Stellar CLI identity/config store
+# ── Local Stellar / Soroban CLI stores ────────────────────────────────────────
 .soroban/
+.stellar/
 
-# Editor / IDE
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.iml
+.editorconfig.local
 
-# OS
+# ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+desktop.ini
 
-# Node (frontend/backend tooling)
+# ── Node (frontend / backend tooling) ────────────────────────────────────────
 node_modules/
 dist/
 .cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
 
-# Logs
+# ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage and profiling
+lcov.info
+coverage/
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Temporary and generated files
+*.tmp
+*.bak
+*.orig
+*.rej
+.tmp/
+
+# Benchmark results (keep code, not output data)
+criterion/
+benches/results/
+
+# Secrets and keys (never committed)
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+private/

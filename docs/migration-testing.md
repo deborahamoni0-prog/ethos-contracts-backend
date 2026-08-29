@@ -1,91 +1,216 @@
-# Migration Testing
+# Database Migration Validation Testing (#84)
 
 ## Overview
 
-`backend/src/db.rs` owns a small hand-rolled migration runner: `Db::migrate()`
-applies an ordered list of `(version, sql)` pairs, tracking which versions
-have run in the `schema_migrations` table so re-invoking `migrate()` is
-idempotent. Historically only the "up" (apply) path was tested — nothing
-verified that a migration's rollback path actually restores the prior
-schema and data, only that applying migrations succeeded.
+The migration validation testing framework provides a structured harness for:
 
-## Rollback Support
+- Applying and verifying forward migrations
+- Verifying backward (rollback) migrations
+- Testing round-trip (forward → backward) cycles
+- Measuring migration performance against production-like data volumes
+- Preventing deployment failures by catching migration issues early
 
-`Db::rollback(version: &str)` reverses a single migration:
+## Architecture
 
-1. Runs the reverse SQL registered for that version in the `DOWN_MIGRATIONS`
-   table inside `rollback()`.
-2. Deletes the version's row from `schema_migrations`, so a subsequent
-   `migrate()` call re-applies it.
+### MockDatabase
 
-Every entry in `MIGRATIONS` (the up path) must have a matching entry in
-`DOWN_MIGRATIONS` (the down path). When adding a new migration:
+`MockDatabase` simulates a SQL database for deterministic, isolated migration tests. It supports a subset of SQL statements commonly used in schema migrations:
 
-- If it creates tables/indexes, the down migration must `DROP` exactly what
-  the up migration created.
-- If it alters an existing table (e.g. `ADD COLUMN`), the down migration
-  must reverse that exact alteration (e.g. `DROP COLUMN`, supported by the
-  bundled SQLite version used via `rusqlite`'s `bundled` feature, 3.35+).
-- If it transforms existing data (a backfill `UPDATE`, not just a schema
-  change), the down migration only needs to undo the schema change — data
-  transformations applied to pre-existing rows are not required to be
-  perfectly invertible, but re-applying the migration after a rollback
-  **must** correctly re-derive the transformed values for rows that existed
-  before the rollback. See migration `"10"` (`normalized_frequency`) for an
-  example: it adds a column and backfills it from `frequency`; its down
-  migration just drops the column, and the rollback test suite verifies the
-  backfill is correctly redone on re-apply for a row that existed prior to
-  the rollback.
+| SQL Statement | Supported |
+|---------------|-----------|
+| `CREATE TABLE` | ✅ |
+| `ALTER TABLE` | ✅ |
+| `DROP TABLE` | ✅ |
+| `CREATE INDEX` | ✅ |
+| `INSERT INTO` | ✅ (adds rows) |
+| `DELETE FROM` | ✅ (clears rows) |
+| Other | ❌ (returns error) |
 
-Because later migrations can depend on earlier ones' tables/columns,
-rollbacks must only be performed from the top of the applied version list
-downward (i.e., to roll back version `N`, versions `> N` must already be
-rolled back). `Db::rollback()` does not enforce this — callers (tests, or
-any future rollback tooling) are responsible for rolling back in the
-correct order.
+For production use, replace `MockDatabase` with a real PostgreSQL test instance using transactional rollback to isolate tests.
 
-## Test Coverage
+### Migration Definition
 
-`backend/src/migration_rollback_tests.rs` covers:
+```rust
+use ethos_protocol_backend::migration_testing::Migration;
 
-1. **`test_apply_rollback_reapply_restores_full_schema`** — applies every
-   migration, rolls back every migration (newest to oldest), asserts only
-   the `schema_migrations` tracking table remains, then re-applies
-   everything and asserts the full schema (table and index names) matches
-   the original exactly.
-2. **`test_each_migration_rollback_removes_and_reapply_restores_its_own_objects`** —
-   for each migration from the newest down to version `"3"`, rolls it back
-   in isolation, asserts its table (or, for the column-level migration
-   `"10"`, its column) is gone, then re-applies and asserts the exact same
-   column set is restored.
-3. **`test_data_transformation_migration_rollback_preserves_seed_data`** —
-   seeds a `reminder_preferences` row, rolls back the data-transformation
-   migration `"10"`, asserts the row's other columns are untouched, then
-   re-applies the migration and asserts `normalized_frequency` is correctly
-   backfilled for that pre-existing row (not just for newly inserted rows).
+let migration = Migration::new(
+    "001",                                    // Version identifier
+    "add_vaults_table",                       // Human-readable name
+    "CREATE TABLE vaults (id TEXT PRIMARY KEY, owner TEXT NOT NULL)",  // Forward SQL
+    Some("DROP TABLE vaults"),               // Backward SQL (None = irreversible)
+);
 
-Run locally:
-
-```bash
-cargo test --package ethos-protocol-backend migration_rollback
+assert!(migration.is_reversible()); // true when backward_sql is Some
 ```
 
-## CI
+### Validation Result
 
-`.github/workflows/ci.yml` runs a dedicated "Run migration rollback tests
-(apply, rollback, re-apply)" step on every push/PR, in addition to the
-broader "Run backend cross-cutting integration tests" step (which also
-exercises this file, since it runs the full backend test suite). Both are
-required checks — a PR that breaks a migration's rollback path fails CI
-before it can merge.
+Every migration operation returns a `ValidationResult`:
 
-## Adding a New Migration: Checklist
+```rust
+pub struct ValidationResult {
+    pub migration_version: String,    // e.g. "001"
+    pub direction: MigrationDirection, // Forward or Backward
+    pub success: bool,
+    pub duration: Duration,
+    pub error_message: Option<String>, // Set on failure
+    pub rows_affected: Option<u64>,    // Set on success
+}
+```
 
-- [ ] Add the up migration to `MIGRATIONS` in `Db::migrate()`.
-- [ ] Add the matching down migration to `DOWN_MIGRATIONS` in `Db::rollback()`.
-- [ ] If the migration transforms existing data, add or extend a test in
-      `migration_rollback_tests.rs` seeding a pre-existing row and asserting
-      the transformation is correctly redone after a rollback + re-apply
-      cycle.
-- [ ] Run `cargo test --package ethos-protocol-backend migration_rollback`
-      locally before opening a PR.
+## Usage
+
+### Forward Migration Test
+
+```rust
+use ethos_protocol_backend::migration_testing::{Migration, MigrationTester};
+
+let mut tester = MigrationTester::new();
+
+let migration = Migration::new(
+    "001",
+    "create_vaults",
+    "CREATE TABLE vaults (id TEXT PRIMARY KEY, owner TEXT)",
+    Some("DROP TABLE vaults"),
+);
+
+let result = tester.apply_forward(&migration);
+assert!(result.success);
+assert!(tester.database().table_exists("vaults"));
+assert!(tester.applied_versions().contains(&"001".to_string()));
+```
+
+### Backward (Rollback) Migration Test
+
+```rust
+// After applying forward:
+let rollback = tester.apply_backward(&migration);
+assert!(rollback.success);
+assert!(!tester.database().table_exists("vaults"));
+assert!(tester.applied_versions().is_empty());
+```
+
+### Round-Trip Test
+
+Tests forward + backward in one call. Returns `Vec<ValidationResult>` — one entry per direction:
+
+```rust
+let results = tester.test_round_trip(&migration);
+assert_eq!(results.len(), 2);
+assert!(results[0].success); // Forward
+assert!(results[1].success); // Backward
+```
+
+If the migration has no `backward_sql`, only the forward result is returned.
+
+### Irreversible Migration
+
+```rust
+let migration = Migration::new(
+    "002",
+    "drop_legacy_column",
+    "ALTER TABLE vaults DROP COLUMN legacy_data",
+    None, // Cannot be rolled back
+);
+
+let result = tester.apply_backward(&migration);
+assert!(!result.success);
+assert_eq!(result.error_message.as_deref(), Some("Migration is not reversible"));
+```
+
+## Performance Testing
+
+`PerformanceBenchmark` measures migration execution time against a production-like number of rows:
+
+```rust
+use ethos_protocol_backend::migration_testing::{Migration, MigrationTester, PerformanceBenchmark};
+
+let mut tester = MigrationTester::new();
+
+let migration = Migration::new(
+    "001",
+    "add_index_on_owner",
+    "CREATE INDEX idx_vaults_owner ON test_table(owner)",
+    None,
+);
+
+// Simulate 100,000 rows
+let benchmark = PerformanceBenchmark::run(&migration, &mut tester, 100_000);
+
+println!("Migration: {}", benchmark.migration_version);
+println!("Rows before: {}", benchmark.rows_before);
+println!("Duration: {:?}", benchmark.duration);
+println!("Rows/sec: {:.0}", benchmark.rows_per_second);
+```
+
+### Benchmark Fields
+
+| Field | Description |
+|-------|-------------|
+| `migration_version` | Version string from the migration |
+| `rows_before` | Row count before migration ran |
+| `rows_after` | Row count after migration ran |
+| `duration` | Wall-clock time for the migration |
+| `rows_per_second` | Throughput (rows_before / duration) |
+
+## Migration Sequence Testing
+
+Test a chain of dependent migrations:
+
+```rust
+let migrations = vec![
+    Migration::new("001", "create_vaults", "CREATE TABLE vaults (id TEXT)", Some("DROP TABLE vaults")),
+    Migration::new("002", "create_owners", "CREATE TABLE owners (id TEXT)", Some("DROP TABLE owners")),
+    Migration::new("003", "add_index", "CREATE INDEX idx ON vaults(id)", None),
+];
+
+let mut tester = MigrationTester::new();
+for migration in &migrations {
+    let result = tester.apply_forward(migration);
+    assert!(result.success, "Migration {} failed: {:?}", migration.version, result.error_message);
+}
+
+assert_eq!(tester.applied_versions().len(), 3);
+```
+
+## Production Integration
+
+For real PostgreSQL:
+
+1. Create a test database or use transaction-wrapped tests
+2. Replace `MockDatabase::execute()` with `sqlx::query()` or `diesel::sql_query()`
+3. Use `BEGIN` / `ROLLBACK` transactions to isolate each test run
+4. Run tests against a database seeded with production-like data volumes
+
+```sql
+-- Sample test fixture for production-like volume
+INSERT INTO vaults SELECT gen_random_uuid(), ... FROM generate_series(1, 100000);
+```
+
+## Performance Baselines
+
+When validating migrations, fail the CI job if performance exceeds these thresholds:
+
+| Operation | Max Duration | Notes |
+|-----------|-------------|-------|
+| `CREATE TABLE` | < 100ms | Even at large scale |
+| `ADD COLUMN` | < 500ms | Depends on row count |
+| `CREATE INDEX` | < 30s | On 1M+ rows with `CONCURRENTLY` |
+| `DROP TABLE` | < 100ms | Fast metadata operation |
+
+## CI Integration
+
+Add migration validation as a pre-deploy CI step:
+
+```yaml
+# .github/workflows/ci.yml
+- name: Validate migrations
+  run: |
+    cargo test migration_tester -- --nocapture
+    cargo test performance_benchmark -- --nocapture
+```
+
+## Related Features
+
+- [Database Architecture](./architecture.md)
+- [Deployment Guide](./deployment-guide.md)

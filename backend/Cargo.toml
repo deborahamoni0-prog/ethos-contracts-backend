@@ -2,13 +2,12 @@
 name = "ethos-protocol-backend"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-actix-web = "4"
-actix-rt = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 
@@ -24,7 +23,7 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "decompression-gzip", "decompression-deflate"] }
 
 env_logger = "0.11"
 thiserror = "1"
@@ -35,6 +34,9 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 
 # Push notifications (FCM via HTTP v1 API)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Compression / decompression (gzip, deflate) for request body decompression (#132)
+flate2 = "1"
 
 # GraphQL API alternative to REST (#66)
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
@@ -53,8 +55,21 @@ redis = "0.27"
 rand = "0.8"
 hmac = "0.12"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 once_cell = "1"
+
+# WebAuthn assertion signature verification (#262): CBOR/COSE key parsing and
+# per-algorithm signature verification (ES256 / RS256 / EdDSA).
+#
+# RS256 verification uses `ring` (RsaPublicKeyComponents) rather than the
+# `rsa` crate: `rsa` has an unpatched RUSTSEC-2023-0071 (Marvin Attack timing
+# side-channel) advisory that fails `cargo audit --deny warnings` in CI.
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["der"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ring = "0.17"
+signature = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "zk-verifier-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+zk-verifier = { path = ".." }
+# Keep ed25519-dalek on the 2.x line used by the root workspace's Cargo.lock.
+# soroban-env-host only requires ">=2.0.0", so an unconstrained resolution
+# picks 3.x, which fails to compile against the soroban testutils host
+# (rand_core `TryRng` mismatch in `ChaCha20Rng`). The committed Cargo.lock
+# pins 2.2.0 for every consumer; this direct dependency documents and enforces
+# the same constraint if the lockfile is ever regenerated.
+ed25519-dalek = "2"
+
+[[bin]]
+name = "fuzz_compression"
+path = "src/fuzz_compression.rs"
+test = false
+doc = false

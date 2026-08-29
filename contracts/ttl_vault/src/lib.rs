@@ -11,9 +11,20 @@ use soroban_sdk::{
 };
 
 pub mod composition_rules;
+pub mod credential_anchoring;
+#[cfg(test)]
+mod credential_anchoring_tests;
+pub mod credential_lifecycle;
+#[cfg(test)]
+mod credential_lifecycle_tests;
 mod oracle;
 pub mod ranking;
+pub mod slice_attribute_matching;
+pub mod slice_consensus_voting;
+pub mod slice_cost_tracking;
+pub mod slice_failover;
 pub mod slice_performance;
+pub mod template_inheritance;
 mod types;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
@@ -118,6 +129,8 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_cap_tests;
+#[cfg(test)]
 mod passkey_delegation_tests;
 #[cfg(test)]
 mod passkey_escrow_tests;
@@ -126,7 +139,13 @@ mod passkey_expiry_notification_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
+mod slice_failover_tests;
+#[cfg(test)]
+mod slice_consensus_voting_tests;
+#[cfg(test)]
 mod slice_performance_tests;
+#[cfg(test)]
+mod withdrawal_escrow_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -175,6 +194,18 @@ const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
 /// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
 /// Soroban instruction limit; 50 approaches it. Capped at 20 for headroom.
 pub const MAX_BENEFICIARIES: u32 = 20;
+
+/// Maximum number of on-chain passkey usage entries retained per vault.
+/// Matches the `timestamps.len() > 1000` cap already applied to vault snapshot
+/// timestamps. Once the cap is hit the oldest entry is dropped before writing
+/// the new one, keeping the serialized Vec within Soroban's practical per-entry
+/// storage limits. Full history remains available from emitted events.
+pub const MAX_PASSKEY_USAGE_ENTRIES: u32 = 1000;
+
+/// Maximum number of on-chain passkey audit log entries retained per vault.
+/// Matches the same 1000-entry cap used for passkey usage entries above.
+/// Full history remains available from emitted `pk_audit` events.
+pub const MAX_PASSKEY_AUDIT_ENTRIES: u32 = 1000;
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -342,6 +373,23 @@ pub enum ContractError {
     PasskeyInEscrow = 113,
     // Issue #44: composition rule not found
     RuleNotFound = 114,
+    // Issue #34: credential lifecycle state machine
+    InvalidCredentialState = 115,
+    // Issue #269: credential lifecycle state transitions
+    InvalidStateTransition = 116,
+    // Issue #35: slice failover mechanism
+    InvalidSlice = 117,
+    FailoverAlreadyActive = 118,
+    // Issue #32: credential anchoring to external systems
+    AnchorAlreadyExists = 120,
+    AnchorNotFound = 121,
+    InvalidExternalId = 122,
+    InvalidAnchorSystem = 123,
+    // Issue #37: template inheritance
+    TemplateNotFound = 124,
+    InheritanceCycleDetected = 125,
+    // Slice consensus voting: finalization attempted below the minimum quorum
+    InsufficientQuorum = 126,
 }
 
 #[contract]
@@ -2366,19 +2414,32 @@ impl TtlVaultContract {
     /// * `vault_id` - The vault ID
     /// * `amount` - The amount to hold in escrow
     /// * `beneficiary` - The beneficiary address
+    /// * `caller` - The caller address (must be the vault owner)
     ///
     /// # Returns
     /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If amount is not positive
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than amount
     pub fn create_withdrawal_escrow(
         env: Env,
         vault_id: u64,
         amount: i128,
         beneficiary: Address,
+        caller: Address,
     ) -> Result<(), ContractError> {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        caller.require_auth();
+
         let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -2413,10 +2474,22 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
+    /// * `caller` - The caller address (must be the escrow's beneficiary)
     ///
     /// # Returns
     /// `Ok(())` on success
-    pub fn verify_withdrawal_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If no escrow exists for the vault
+    /// * `ContractError::NotBeneficiary` - If caller is not the escrow's beneficiary
+    /// * `ContractError::InvalidAmount` - If the escrow was already verified
+    pub fn verify_withdrawal_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
         let mut vault = Self::load_vault(&env, vault_id);
         let escrow = env
             .storage()
@@ -2424,6 +2497,9 @@ impl TtlVaultContract {
             .get::<DataKey, WithdrawalEscrow>(&DataKey::WithdrawalEscrow(vault_id))
             .ok_or(ContractError::VaultNotFound)?;
 
+        if caller != escrow.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
         if escrow.verified {
             return Err(ContractError::InvalidAmount);
         }
@@ -8883,6 +8959,13 @@ impl TtlVaultContract {
             timestamp,
         });
 
+        // Drop the oldest entry when the cap is reached so storage size stays
+        // bounded. Full history is preserved in the emitted PASSKEY_USAGE_TOPIC
+        // events for off-chain indexers.
+        if usage.len() > MAX_PASSKEY_USAGE_ENTRIES {
+            usage.remove(0);
+        }
+
         let key = DataKey::PasskeyUsage(vault_id);
         env.storage().persistent().set(&key, &usage);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
@@ -8921,6 +9004,13 @@ impl TtlVaultContract {
             passkey_hash: passkey_hash.clone(),
             timestamp,
         });
+
+        // Drop the oldest entry when the cap is reached so storage size stays
+        // bounded. Full history is preserved in the emitted PASSKEY_AUDIT_TOPIC
+        // events for off-chain indexers.
+        if log.len() > MAX_PASSKEY_AUDIT_ENTRIES {
+            log.remove(0);
+        }
 
         env.storage().persistent().set(&key, &log);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
@@ -9486,8 +9576,32 @@ impl TtlVaultContract {
         let timestamp = env.ledger().timestamp();
 
         for i in 0..10 {
-            let _hash_input = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
+            // Include the generation timestamp and index so every issued code is
+            // distinct. Replacing the stored vector below then makes the prior
+            // generation unambiguously invalid, even when codes are regenerated
+            // in the same ledger timestamp.
+            let code_number = vault_id
+                .wrapping_mul(timestamp)
+                .wrapping_add(i as u64);
             let code_str = String::from_str(&env, "code");
+            let mut suffix = String::from_str(&env, "");
+            let mut remaining = code_number;
+            if remaining == 0 {
+                suffix.push_str(&String::from_str(&env, "0"));
+            } else {
+                let mut digits = [0u8; 20];
+                let mut digit_count = 0usize;
+                while remaining > 0 {
+                    digits[digit_count] = b'0' + (remaining % 10) as u8;
+                    digit_count += 1;
+                    remaining /= 10;
+                }
+                while digit_count > 0 {
+                    digit_count -= 1;
+                    suffix.push_str(&String::from_bytes(&env, &Bytes::from_array(&env, &[digits[digit_count]])));
+                }
+            }
+            let code_str = code_str.concat(&suffix);
             codes.push_back(BackupCode {
                 code: code_str.clone(),
                 used: false,
@@ -14543,6 +14657,104 @@ impl TtlVaultContract {
         slice_performance::get_slice_weights(&env, slice_id)
     }
 
+    // ── Issue #41: Slice Reputation Decay ────────────────────────────────────
+
+    /// Apply reputation decay to an attestor on a slice due to degraded performance.
+    ///
+    /// Only the vault owner may apply decay.
+    ///
+    /// - `decay_rate_bps` — decay percentage in basis points (0-10000)
+    ///   - 10000 = preserve reputation (no decay)
+    ///   - 5000 = apply 50% decay
+    ///   - 0 = complete decay (reputation → 0)
+    /// - `reason` — descriptive reason for the decay
+    ///
+    /// Returns the new reputation factor (0-10000).
+    pub fn apply_reputation_decay(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestor: Address,
+        decay_rate_bps: u32,
+        reason: String,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        // Validate decay_rate is in valid BPS range.
+        if decay_rate_bps > 10_000u32 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let new_reputation = slice_performance::apply_reputation_decay(
+            &env,
+            slice_id,
+            &attestor,
+            decay_rate_bps,
+            reason,
+        );
+        Ok(new_reputation)
+    }
+
+    /// Recover reputation for an attestor when performance improves.
+    ///
+    /// Only the vault owner may apply recovery.
+    ///
+    /// - `improvement_rate_bps` — recovery percentage in basis points (0-10000)
+    ///   - 10000 = maximum recovery rate
+    ///   - 5000 = recover at 50% rate
+    ///   - 0 = no recovery
+    ///
+    /// Returns the new reputation factor (0-10000).
+    pub fn apply_reputation_recovery(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestor: Address,
+        improvement_rate_bps: u32,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        // Validate improvement_rate is in valid BPS range.
+        if improvement_rate_bps > 10_000u32 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let new_reputation = slice_performance::apply_reputation_recovery(
+            &env,
+            slice_id,
+            &attestor,
+            improvement_rate_bps,
+        );
+        Ok(new_reputation)
+    }
+
+    /// Get the current reputation factor for an attestor on a slice.
+    /// Returns 10000 if the attestor has full reputation.
+    pub fn get_reputation_factor(env: Env, slice_id: u64, attestor: Address) -> u32 {
+        slice_performance::get_reputation_factor(&env, slice_id, &attestor)
+    }
+
+    /// Get decay history for an attestor on a slice.
+    /// Returns up to `limit` entries, most recent first.
+    pub fn get_decay_history(
+        env: Env,
+        slice_id: u64,
+        attestor: Address,
+        limit: u64,
+    ) -> Vec<slice_performance::DecayHistoryEntry> {
+        slice_performance::get_decay_history(&env, slice_id, &attestor, limit)
+    }
+
     // ── Issue #44: Slice Composition Validation Rules Engine ─────────────────
 
     /// Register a new composition rule and return its auto-assigned `rule_id`.
@@ -14640,5 +14852,435 @@ impl TtlVaultContract {
     /// Retrieve the rule IDs associated with `slice_id`.
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
+    }
+
+    // ── Issue #32: Credential Anchoring to External Systems ───────────────────
+
+    /// Anchor `credential_id` to `external_id` within `system`.
+    ///
+    /// This contract does not track credential ownership, so any caller may
+    /// register an anchor as long as they authorize the call themselves.
+    ///
+    /// # Errors
+    /// * `InvalidExternalId` — `external_id` is empty or exceeds
+    ///   `credential_anchoring::MAX_EXTERNAL_ID_LEN`.
+    /// * `InvalidAnchorSystem` — `system` is empty or exceeds
+    ///   `credential_anchoring::MAX_SYSTEM_LEN`.
+    /// * `AnchorAlreadyExists` — an anchor for `(external_id, system)` already
+    ///   exists; remove it first via `remove_credential_anchor`.
+    pub fn create_credential_anchor(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if external_id.is_empty() || external_id.len() > credential_anchoring::MAX_EXTERNAL_ID_LEN {
+            return Err(ContractError::InvalidExternalId);
+        }
+        if system.is_empty() || system.len() > credential_anchoring::MAX_SYSTEM_LEN {
+            return Err(ContractError::InvalidAnchorSystem);
+        }
+        if credential_anchoring::create_credential_anchor(&env, credential_id, external_id, system)
+        {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorAlreadyExists)
+        }
+    }
+
+    /// Look up the credential ID anchored to `(external_id, system)`, if any.
+    /// Read-only; no authorization required.
+    pub fn verify_external_anchor(env: Env, external_id: Bytes, system: Bytes) -> Option<u64> {
+        credential_anchoring::verify_external_anchor(&env, &external_id, &system)
+    }
+
+    /// Remove the anchor for `(external_id, system)` from `credential_id`.
+    ///
+    /// # Errors
+    /// * `AnchorNotFound` — no anchor exists for `(external_id, system)`.
+    pub fn remove_credential_anchor(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if credential_anchoring::remove_credential_anchor(
+            &env,
+            credential_id,
+            &external_id,
+            &system,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorNotFound)
+        }
+    }
+
+    /// Retrieve all anchors registered for `credential_id`.
+    /// Read-only; no authorization required.
+    pub fn get_credential_anchors(
+        env: Env,
+        credential_id: u64,
+    ) -> Vec<credential_anchoring::CredentialAnchor> {
+        credential_anchoring::get_credential_anchors(&env, credential_id)
+    }
+
+    // ── Issue #269: Credential Lifecycle State Machine ────────────────────────
+
+    /// Initialize a credential with Draft state.
+    ///
+    /// No-op if the credential already has a state, so an existing (including
+    /// Revoked/Archived) credential can never be reset back to Draft.
+    ///
+    /// # Arguments
+    /// * `credential_id` - The credential ID to initialize
+    ///
+    /// # Panics
+    /// * Panics if the contract is paused
+    pub fn init_credential(env: Env, credential_id: u64) {
+        Self::assert_not_paused(&env);
+        credential_lifecycle::init_credential_state(&env, credential_id);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Get the current lifecycle state of a credential.
+    ///
+    /// # Arguments
+    /// * `credential_id` - The credential ID to query
+    ///
+    /// # Returns
+    /// The current CredentialState (Draft, Active, Suspended, Revoked, Expired, or Archived)
+    pub fn get_credential_state(
+        env: Env,
+        credential_id: u64,
+    ) -> credential_lifecycle::CredentialState {
+        credential_lifecycle::get_credential_state(&env, credential_id)
+    }
+
+    /// Activate a credential (transition from Draft to Active).
+    ///
+    /// Only the contract admin can activate credentials.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to activate the credential
+    /// * `credential_id` - The credential ID to activate
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn activate_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Active,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Suspend a credential (transition to Suspended state).
+    ///
+    /// Only the contract admin can suspend credentials.
+    /// Suspended credentials can be reactivated later.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to suspend the credential
+    /// * `credential_id` - The credential ID to suspend
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn suspend_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Suspended,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Revoke a credential (transition to Revoked state).
+    ///
+    /// Only the contract admin can revoke credentials.
+    /// Revoked credentials cannot be reactivated - this is a terminal state.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to revoke the credential
+    /// * `credential_id` - The credential ID to revoke
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn revoke_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Revoked,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Archive a credential (transition to Archived state).
+    ///
+    /// Only the contract admin can archive credentials.
+    /// Archived credentials are read-only and cannot transition to other states.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to archive the credential
+    /// * `credential_id` - The credential ID to archive
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn archive_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Archived,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Mark a credential as expired (transition to Expired state).
+    ///
+    /// Only the contract admin can mark credentials as expired.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to expire the credential
+    /// * `credential_id` - The credential ID to expire
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn expire_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Expired,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    // ── Issue #35: Slice Failover Mechanism ────────────────────────────────────
+
+    /// Register a backup slice for a primary slice.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    /// * `ContractError::InvalidSlice` - primary and backup slice IDs are equal
+    pub fn register_backup_slice(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        failure_threshold: u32,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::register_backup_slice(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            failure_threshold,
+        ))
+    }
+
+    /// Get the list of backup slices registered for a primary slice.
+    /// Read-only; no authorization required.
+    pub fn get_backup_slices(env: Env, primary_slice_id: u64) -> Vec<u64> {
+        slice_failover::get_backup_slices(&env, primary_slice_id)
+    }
+
+    /// Get the currently active slice for a primary slice (itself if no failover).
+    /// Read-only; no authorization required.
+    pub fn get_active_slice(env: Env, slice_id: u64) -> u64 {
+        slice_failover::get_active_slice(&env, slice_id)
+    }
+
+    /// Get the current recorded failure count for a slice.
+    /// Read-only; no authorization required.
+    pub fn get_failure_count(env: Env, slice_id: u64) -> u32 {
+        slice_failover::get_failure_count(&env, slice_id)
+    }
+
+    /// Record a failure for a slice. Automatically activates failover to the
+    /// registered backup once the configured failure threshold is reached.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn record_slice_failure(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::record_slice_failure(
+            &env,
+            primary_slice_id,
+            reason,
+        ))
+    }
+
+    /// Explicitly activate failover from a primary slice to a registered backup.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn activate_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::activate_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            reason,
+        ))
+    }
+
+    /// Revert an active failover, restoring the primary slice and resetting
+    /// its failure counter.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn revert_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::revert_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+        ))
     }
 }

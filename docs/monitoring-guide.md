@@ -18,6 +18,15 @@ The backend exposes a `/metrics` endpoint in Prometheus text format. Grafana scr
 | `ethos_protocol_contract_paused` | Gauge | 1 if contract is paused, 0 otherwise |
 | `ethos_protocol_http_requests_total` | Counter | HTTP requests by method, path, status |
 | `ethos_protocol_http_request_duration_seconds` | Histogram | HTTP request latency |
+| `ethos_protocol_load_shedding_inflight` | Gauge | Current in-flight request count ([load shedding](./load-shedding.md)) |
+| `ethos_protocol_load_shedding_shed_total` | Counter | Requests shed due to overload |
+| `ethos_protocol_batch_current_size` | Gauge | Current [adaptive batch](./adaptive-batching.md) size |
+| `ethos_protocol_scaling_recommended_replicas` | Gauge | [Predictive scaling](./predictive-scaling.md) replica recommendation |
+
+See [`request-prioritization.md`](./request-prioritization.md),
+[`load-shedding.md`](./load-shedding.md), [`adaptive-batching.md`](./adaptive-batching.md)
+and [`predictive-scaling.md`](./predictive-scaling.md) for the full metric
+lists and configuration for those features.
 
 ## Prometheus Setup
 

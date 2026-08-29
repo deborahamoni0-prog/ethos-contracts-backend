@@ -62,6 +62,30 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
+    /// Prometheus-style counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Per-priority concurrency enforcement (#129).
+    pub priority_enforcer: Arc<crate::priority::PriorityEnforcer>,
+    /// Adaptive overload protection (#128).
+    pub load_shedder: Arc<crate::load_shedding::LoadShedder>,
+    /// Adaptive batch sizing for background batch jobs (#131).
+    pub batcher: Arc<crate::batching::AdaptiveBatcher>,
+    /// Traffic forecasting and replica recommendations (#130).
+    pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
+    /// Append-only event log + snapshot store (#151).
+    pub event_sourcing: Arc<crate::event_sourcing::EventSourcingState>,
+    /// In-process message broker for event-driven integration (#150).
+    pub message_queue: Arc<crate::message_queue::MessageQueueState>,
+    /// Graceful degradation: shared capability status registry across instances.
+    pub degradation_state: Arc<crate::degradation::DegradationState>,
+    /// SQL-backed feature flag store (#274). Shared across all instances so
+    /// every update is immediately visible regardless of which instance
+    /// received the write.
+    pub flag_state: Arc<crate::feature_flags::FlagState>,
+    /// Query result cache stats (#80).
+    pub query_cache: Arc<crate::query_cache::QueryCache>,
+    /// Distributed-lock deadlock detector stats (#82).
+    pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -87,6 +111,34 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
         state.graphql_schema.clone()
     }
 }
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
+    }
+}
+
+// NOTE: The following FromRef implementations reference fields that are not currently
+// in AppState. When these features are properly implemented, uncomment and add the
+// corresponding fields to AppState.
+//
+// impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+//     fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+//         Arc::clone(&state.profiler_state)
+//     }
+// }
+//
+// impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+//     fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+//         Arc::clone(&state.cost_state)
+//     }
+// }
 
 pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
     let vaults = store.lock().unwrap();
@@ -552,7 +604,25 @@ impl Db {
     }
 }
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+
+fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
+    match status {
+        crate::models::VaultStatus::Active => "active",
+        crate::models::VaultStatus::Expired => "expired",
+        crate::models::VaultStatus::Released => "released",
+        crate::models::VaultStatus::Paused => "paused",
+    }
+}
+
+fn vault_status_from_str(s: &str) -> crate::models::VaultStatus {
+    match s {
+        "expired" => crate::models::VaultStatus::Expired,
+        "released" => crate::models::VaultStatus::Released,
+        "paused" => crate::models::VaultStatus::Paused,
+        _ => crate::models::VaultStatus::Active,
+    }
+}
 
 pub struct PoolConfig {
     pub min: u32,
@@ -596,8 +666,20 @@ pub struct Db {
     // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
     #[allow(dead_code)]
     pool_config: PoolConfig,
-    /// In-memory vault store shared across the application.
+    /// In-memory read cache mirroring the `vaults` table, kept in sync by
+    /// `insert_vault`. The `vaults` table (via `conn`) is the durable source
+    /// of truth read by `get_vault`; this cache exists only for call sites
+    /// (e.g. `simulate_release_handler`) that need to scan every vault
+    /// without a `SELECT *` round trip.
     pub vault_store: VaultStore,
+}
+
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately opaque: the connection cannot be inspected while the
+        // pool mutex may be contended, and it never contains secrets.
+        f.debug_struct("Db").finish_non_exhaustive()
+    }
 }
 
 impl Db {
@@ -619,17 +701,65 @@ impl Db {
         })
     }
 
-    /// Insert or replace a vault in the in-memory store.
+    /// Insert or replace a vault. Persists to the `vaults` table so the vault
+    /// survives process restarts and is visible to every instance sharing the
+    /// same SQLite file, then mirrors the write into the in-memory
+    /// `vault_store` cache.
     pub fn insert_vault(&self, vault: crate::models::Vault) {
+        let _ = self.conn.lock().unwrap().execute(
+            r"INSERT OR REPLACE INTO vaults
+                (id, owner, beneficiary, balance, check_in_interval, last_check_in, created_at, status, ttl_remaining)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                vault.id,
+                vault.owner,
+                vault.beneficiary,
+                vault.balance.to_string(),
+                vault.check_in_interval.cast_signed(),
+                vault.last_check_in.to_rfc3339(),
+                vault.created_at.to_rfc3339(),
+                vault_status_to_str(&vault.status),
+                vault.ttl_remaining.map(u64::cast_signed),
+            ],
+        );
         self.vault_store
             .lock()
             .unwrap()
             .insert(vault.id.clone(), vault);
     }
 
-    /// Retrieve a vault from the in-memory store by string ID.
+    /// Retrieve a vault by string ID from the `vaults` table.
     pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        self.vault_store.lock().unwrap().get(vault_id).cloned()
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding
+            .prepare(
+                r"SELECT id, owner, beneficiary, balance, check_in_interval, last_check_in,
+                         created_at, status, ttl_remaining
+                  FROM vaults WHERE id = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![vault_id], |r| {
+            let balance_str: String = r.get(3)?;
+            let last_check_in_str: String = r.get(5)?;
+            let created_at_str: String = r.get(6)?;
+            let status_str: String = r.get(7)?;
+            Ok(crate::models::Vault {
+                id: r.get(0)?,
+                owner: r.get(1)?,
+                beneficiary: r.get(2)?,
+                balance: balance_str.parse().unwrap_or(0),
+                check_in_interval: r.get::<_, i64>(4)? as u64,
+                last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                status: vault_status_from_str(&status_str),
+                ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+            })
+        })
+        .ok()
     }
 
     pub fn check_connectivity(&self) -> Result<(), rusqlite::Error> {
@@ -851,12 +981,156 @@ impl Db {
                 ",
             ),
             (
-                // Data-transformation migration (not just a schema change):
-                // adds a column *and* backfills it from existing row data.
                 "10",
                 r"
-                ALTER TABLE reminder_preferences ADD COLUMN normalized_frequency TEXT;
-                UPDATE reminder_preferences SET normalized_frequency = UPPER(frequency);
+                CREATE TABLE IF NOT EXISTS data_retention_policies (
+                    data_type        TEXT PRIMARY KEY,
+                    retention_days   INTEGER NOT NULL,
+                    enabled          INTEGER NOT NULL DEFAULT 1,
+                    description      TEXT NOT NULL DEFAULT '',
+                    created_at       TEXT NOT NULL,
+                    updated_at       TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS retention_deletion_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_type    TEXT NOT NULL,
+                    deleted_rows INTEGER NOT NULL,
+                    purged_at    TEXT NOT NULL,
+                    actor        TEXT NOT NULL DEFAULT 'system',
+                    details      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS retention_exceptions (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_type    TEXT NOT NULL,
+                    record_id    TEXT NOT NULL,
+                    reason       TEXT NOT NULL,
+                    expires_at   TEXT,
+                    created_at   TEXT NOT NULL,
+                    created_by   TEXT NOT NULL DEFAULT 'system'
+                );
+                ",
+            ),
+            (
+                "11",
+                r"
+                -- #101: Encryption key version metadata
+                CREATE TABLE IF NOT EXISTS encryption_key_versions (
+                    version     INTEGER PRIMARY KEY,
+                    status      TEXT NOT NULL DEFAULT 'active',
+                    created_at  TEXT NOT NULL,
+                    rotated_at  TEXT
+                );
+
+                -- #103: Secret rotation policies and logs
+                CREATE TABLE IF NOT EXISTS secret_rotation_policies (
+                    secret_type             TEXT PRIMARY KEY,
+                    rotation_interval_days  INTEGER NOT NULL,
+                    grace_period_hours      INTEGER NOT NULL DEFAULT 24,
+                    auto_rotate             INTEGER NOT NULL DEFAULT 0,
+                    notify_channels         TEXT NOT NULL DEFAULT '[]',
+                    created_at              TEXT NOT NULL,
+                    updated_at              TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS secret_rotation_logs (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    secret_type           TEXT NOT NULL,
+                    rotated_at            TEXT NOT NULL,
+                    actor                 TEXT NOT NULL DEFAULT 'system',
+                    grace_period_active   INTEGER NOT NULL DEFAULT 0,
+                    grace_period_ends_at  TEXT,
+                    notes                 TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_secret_rotation_logs_type
+                    ON secret_rotation_logs(secret_type);
+                CREATE INDEX IF NOT EXISTS idx_secret_rotation_logs_at
+                    ON secret_rotation_logs(rotated_at);
+                ",
+            ),
+            (
+                "12",
+                r"
+                -- Graceful degradation: capability status registry
+                -- Shared across all instances in a load-balanced deployment.
+                CREATE TABLE IF NOT EXISTS capability_statuses (
+                    name                 TEXT PRIMARY KEY,
+                    level                TEXT NOT NULL,
+                    reason               TEXT,
+                    fallback_available   INTEGER NOT NULL DEFAULT 0,
+                    updated_at           TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_capability_statuses_updated_at
+                    ON capability_statuses(updated_at);
+                ",
+            ),
+            (
+                "13",
+                r"
+                -- #264: durable SQL-backed vault storage, mirroring
+                -- crate::models::Vault (previously in-memory only).
+                CREATE TABLE IF NOT EXISTS vaults (
+                    id                 TEXT PRIMARY KEY,
+                    owner              TEXT NOT NULL,
+                    beneficiary        TEXT NOT NULL,
+                    balance            TEXT NOT NULL,
+                    check_in_interval  INTEGER NOT NULL,
+                    last_check_in      TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    ttl_remaining      INTEGER
+                );
+                ",
+            ),
+            (
+                "14",
+                r"
+                -- #274: SQL-backed feature flag storage so all instances share
+                -- the same flag state and the version history is durable.
+                CREATE TABLE IF NOT EXISTS feature_flags (
+                    key                  TEXT PRIMARY KEY,
+                    description          TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 0,
+                    rollout_percentage   INTEGER NOT NULL DEFAULT 100,
+                    version              INTEGER NOT NULL DEFAULT 1,
+                    created_at           TEXT NOT NULL,
+                    updated_at           TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS feature_flag_history (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    flag_key             TEXT NOT NULL,
+                    version              INTEGER NOT NULL,
+                    enabled              INTEGER NOT NULL,
+                    rollout_percentage   INTEGER NOT NULL,
+                    updated_at           TEXT NOT NULL,
+                    updated_by           TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_feature_flag_history_key
+                    ON feature_flag_history(flag_key);
+                ",
+            ),
+            (
+                "15",
+                r"
+                -- #151/#274 follow-up: the event-sourcing persistence layer
+                -- (`Db::insert_event`, `Db::get_events_for_vault`) and the
+                -- snapshot store (`Db::upsert_snapshot`, `Db::get_snapshot`)
+                -- write to these tables, but no migration created them.
+                CREATE TABLE IF NOT EXISTS events (
+                    vault_id       TEXT NOT NULL,
+                    sequence       INTEGER NOT NULL,
+                    event_type     TEXT NOT NULL,
+                    timestamp      TEXT NOT NULL,
+                    data           TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    PRIMARY KEY (vault_id, sequence)
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_vault
+                    ON events(vault_id);
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    vault_id          TEXT PRIMARY KEY,
+                    snapshot_sequence INTEGER NOT NULL,
+                    taken_at          TEXT NOT NULL,
+                    state             TEXT NOT NULL
+                );
                 ",
             ),
         ];
@@ -1603,7 +1877,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_tenant(&self, tenant_id: &str) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
+    pub fn get_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             "SELECT id, name, owner, created_at, updated_at, is_active FROM tenants WHERE id = ?1",
@@ -1613,11 +1890,23 @@ impl Db {
             let created_at_str: String = r.get(3)?;
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let updated_at_str: String = r.get(4)?;
             let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let is_active_i: i64 = r.get(5)?;
             Ok(crate::models::Tenant {
                 id: r.get(0)?,
@@ -1634,7 +1923,11 @@ impl Db {
         }
     }
 
-    pub fn add_vault_to_tenant(&self, tenant_id: &str, vault_id: &str) -> Result<(), rusqlite::Error> {
+    pub fn add_vault_to_tenant(
+        &self,
+        tenant_id: &str,
+        vault_id: &str,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO tenant_vaults (tenant_id, vault_id) VALUES (?1, ?2)",
             params![tenant_id, vault_id],
@@ -1644,9 +1937,8 @@ impl Db {
 
     pub fn get_tenant_vaults(&self, tenant_id: &str) -> Result<Vec<String>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            "SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1",
-        )?;
+        let mut stmt =
+            binding.prepare("SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1")?;
         let iter = stmt.query_map(params![tenant_id], |r| r.get(0))?;
         let mut vaults = Vec::new();
         for vault_result in iter {
@@ -1655,13 +1947,19 @@ impl Db {
         Ok(vaults)
     }
 
-    pub fn upsert_tenant_billing(&self, billing: &crate::models::TenantBilling) -> Result<(), rusqlite::Error> {
+    pub fn upsert_tenant_billing(
+        &self,
+        billing: &crate::models::TenantBilling,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT OR REPLACE INTO tenant_billing (tenant_id, monthly_charge, billing_cycle_start, billing_cycle_end, total_vaults, status)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 billing.tenant_id,
-                billing.monthly_charge,
+                // Stored as its decimal string (same convention as
+                // `insert_vault`) because rusqlite's ToSql does not support
+                // i128 and an `as i64` cast could silently truncate.
+                billing.monthly_charge.to_string(),
                 billing.billing_cycle_start.to_rfc3339(),
                 billing.billing_cycle_end.to_rfc3339(),
                 billing.total_vaults as i64,
@@ -1673,7 +1971,10 @@ impl Db {
 
     // ── #70: Real-Time Collaboration ────────────────────────────────────────
 
-    pub fn store_credential_update(&self, update: &crate::models::CredentialUpdate) -> Result<(), rusqlite::Error> {
+    pub fn store_credential_update(
+        &self,
+        update: &crate::models::CredentialUpdate,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO credential_updates (id, vault_id, user_id, field, old_value, new_value, timestamp, operation_id)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1691,7 +1992,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn store_operational_transform(&self, transform: &crate::models::OperationalTransform) -> Result<(), rusqlite::Error> {
+    pub fn store_operational_transform(
+        &self,
+        transform: &crate::models::OperationalTransform,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1709,7 +2013,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn store_conflict_resolution(&self, resolution: &crate::models::ConflictResolution) -> Result<(), rusqlite::Error> {
+    pub fn store_conflict_resolution(
+        &self,
+        resolution: &crate::models::ConflictResolution,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO conflict_resolutions (conflict_id, vault_id, update1_id, update2_id, resolution_strategy, resolved_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1725,7 +2032,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn upsert_user_presence(&self, presence: &crate::models::UserPresence) -> Result<(), rusqlite::Error> {
+    pub fn upsert_user_presence(
+        &self,
+        presence: &crate::models::UserPresence,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT OR REPLACE INTO user_presence (user_id, vault_id, status, last_seen, session_id)
                VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1740,7 +2050,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_vault_presence(&self, vault_id: &str) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
+    pub fn get_vault_presence(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             "SELECT user_id, vault_id, status, last_seen, session_id FROM user_presence WHERE vault_id = ?1",
@@ -1749,7 +2062,13 @@ impl Db {
             let last_seen_str: String = r.get(3)?;
             let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(crate::models::UserPresence {
                 user_id: r.get(0)?,
                 vault_id: r.get(1)?,
@@ -1765,7 +2084,10 @@ impl Db {
         Ok(presence)
     }
 
-    pub fn create_collaborative_session(&self, session: &crate::models::CollaborativeSession) -> Result<(), rusqlite::Error> {
+    pub fn create_collaborative_session(
+        &self,
+        session: &crate::models::CollaborativeSession,
+    ) -> Result<(), rusqlite::Error> {
         let participants_json = serde_json::to_string(&session.participants).unwrap_or_default();
         self.conn.lock().unwrap().execute(
             r"INSERT INTO collaborative_sessions (session_id, vault_id, created_at, participants, is_active)
@@ -1783,7 +2105,12 @@ impl Db {
 
     // ── #71: Full-Text Search ───────────────────────────────────────────────
 
-    pub fn index_vault_content(&self, vault_id: &str, title: &str, content: &str) -> Result<(), rusqlite::Error> {
+    pub fn index_vault_content(
+        &self,
+        vault_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<(), rusqlite::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
@@ -1794,7 +2121,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn search_indexed_content(&self, query: &str, limit: u32) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
+    pub fn search_indexed_content(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             r"SELECT id, vault_id, title, content FROM full_text_search_index
@@ -1826,7 +2157,12 @@ impl Db {
         Ok(results)
     }
 
-    pub fn add_search_facet(&self, vault_id: &str, facet_name: &str, value: &str) -> Result<(), rusqlite::Error> {
+    pub fn add_search_facet(
+        &self,
+        vault_id: &str,
+        facet_name: &str,
+        value: &str,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO search_facets (vault_id, facet_name, value, count)
                VALUES (?1, ?2, ?3, 1)
@@ -1837,12 +2173,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_search_facets(&self, vault_id: &str) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
+    pub fn get_search_facets(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            "SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1",
-        )?;
-        let facet_names: Vec<String> = stmt.query_map(params![vault_id], |r| r.get(0))?
+        let mut stmt =
+            binding.prepare("SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1")?;
+        let facet_names: Vec<String> = stmt
+            .query_map(params![vault_id], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut facets = Vec::new();
@@ -1850,12 +2189,13 @@ impl Db {
             let mut values_stmt = binding.prepare(
                 "SELECT value, count FROM search_facets WHERE vault_id = ?1 AND facet_name = ?2",
             )?;
-            let values: Vec<crate::models::FacetValue> = values_stmt.query_map(params![vault_id, &facet_name], |r| {
-                Ok(crate::models::FacetValue {
-                    value: r.get(0)?,
-                    count: r.get::<_, i64>(1)? as u32,
-                })
-            })?
+            let values: Vec<crate::models::FacetValue> = values_stmt
+                .query_map(params![vault_id, &facet_name], |r| {
+                    Ok(crate::models::FacetValue {
+                        value: r.get(0)?,
+                        count: r.get::<_, i64>(1)? as u32,
+                    })
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
 
             facets.push(crate::models::SearchFacet {
@@ -1864,6 +2204,1112 @@ impl Db {
             });
         }
         Ok(facets)
+    }
+
+    // ── #100: Data Retention Policies ───────────────────────────────────────
+
+    /// Insert or replace a retention policy for a given data type.
+    pub fn upsert_retention_policy(
+        &self,
+        policy: &crate::models::DataRetentionPolicy,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO data_retention_policies
+                (data_type, retention_days, enabled, description, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+              ON CONFLICT(data_type) DO UPDATE SET
+                retention_days = excluded.retention_days,
+                enabled        = excluded.enabled,
+                description    = excluded.description,
+                updated_at     = excluded.updated_at",
+            params![
+                policy.data_type,
+                policy.retention_days as i64,
+                if policy.enabled { 1i64 } else { 0i64 },
+                policy.description,
+                policy.created_at.to_rfc3339(),
+                policy.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a single retention policy by data type.
+    pub fn get_retention_policy(
+        &self,
+        data_type: &str,
+    ) -> Result<Option<crate::models::DataRetentionPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
+               FROM data_retention_policies WHERE data_type = ?1",
+        )?;
+        match stmt.query_row(params![data_type], |r| Self::row_to_retention_policy(r)) {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all configured retention policies.
+    pub fn list_retention_policies(
+        &self,
+    ) -> Result<Vec<crate::models::DataRetentionPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
+               FROM data_retention_policies ORDER BY data_type",
+        )?;
+        let iter = stmt.query_map([], |r| Self::row_to_retention_policy(r))?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_retention_policy(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::DataRetentionPolicy, rusqlite::Error> {
+        let created_at = Self::parse_rfc3339_col(r, 4)?;
+        let updated_at = Self::parse_rfc3339_col(r, 5)?;
+        let enabled_i: i64 = r.get(2)?;
+        Ok(crate::models::DataRetentionPolicy {
+            data_type: r.get(0)?,
+            retention_days: r.get::<_, i64>(1)? as u32,
+            enabled: enabled_i != 0,
+            description: r.get(3)?,
+            created_at,
+            updated_at,
+        })
+    }
+
+    /// Purge records older than `retention_days` for the given `table` using
+    /// its `timestamp_col`. Returns the number of rows deleted.
+    /// Skips any record whose ID appears in the retention_exceptions table.
+    pub fn purge_by_retention_policy(
+        &self,
+        data_type: &str,
+        table: &str,
+        id_col: &str,
+        timestamp_col: &str,
+        retention_days: u32,
+        actor: &str,
+    ) -> Result<u64, rusqlite::Error> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days))).to_rfc3339();
+
+        // Build a DELETE that honours active exceptions.
+        let sql = format!(
+            "DELETE FROM {table} WHERE {timestamp_col} < ?1 \
+             AND {id_col} NOT IN ( \
+               SELECT record_id FROM retention_exceptions \
+               WHERE data_type = ?2 \
+               AND (expires_at IS NULL OR expires_at > ?3) \
+             )"
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        let deleted = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute(&sql, params![cutoff, data_type, now])?;
+
+        // Write an audit entry in the deletion log.
+        let details = serde_json::json!({
+            "table": table,
+            "cutoff": cutoff,
+            "retention_days": retention_days,
+        });
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO retention_deletion_log (data_type, deleted_rows, purged_at, actor, details)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                data_type,
+                deleted as i64,
+                chrono::Utc::now().to_rfc3339(),
+                actor,
+                details.to_string(),
+            ],
+        )?;
+
+        Ok(deleted as u64)
+    }
+
+    /// Add a retention exception for a specific record.
+    pub fn add_retention_exception(
+        &self,
+        exc: &crate::models::RetentionException,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO retention_exceptions
+                (data_type, record_id, reason, expires_at, created_at, created_by)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                exc.data_type,
+                exc.record_id,
+                exc.reason,
+                exc.expires_at.map(|d| d.to_rfc3339()),
+                exc.created_at.to_rfc3339(),
+                exc.created_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all active (non-expired) retention exceptions for a data type.
+    pub fn list_retention_exceptions(
+        &self,
+        data_type: &str,
+    ) -> Result<Vec<crate::models::RetentionException>, rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, data_type, record_id, reason, expires_at, created_at, created_by
+               FROM retention_exceptions
+               WHERE data_type = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+               ORDER BY created_at DESC",
+        )?;
+        let iter = stmt.query_map(params![data_type, now], |r| {
+            let expires_at: Option<String> = r.get(4)?;
+            let expires_at_dt = expires_at.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            let created_at = Self::parse_rfc3339_col(r, 5)?;
+            Ok(crate::models::RetentionException {
+                id: r.get(0)?,
+                data_type: r.get(1)?,
+                record_id: r.get(2)?,
+                reason: r.get(3)?,
+                expires_at: expires_at_dt,
+                created_at,
+                created_by: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Retrieve the deletion audit trail for a data type (most-recent first).
+    pub fn list_retention_deletion_log(
+        &self,
+        data_type: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::models::RetentionDeletionLog>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let (sql, param): (String, Option<String>) = if let Some(dt) = data_type {
+            (
+                format!(
+                    "SELECT id, data_type, deleted_rows, purged_at, actor, details \
+                     FROM retention_deletion_log WHERE data_type = ?1 \
+                     ORDER BY purged_at DESC LIMIT {limit}"
+                ),
+                Some(dt.to_string()),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT id, data_type, deleted_rows, purged_at, actor, details \
+                     FROM retention_deletion_log ORDER BY purged_at DESC LIMIT {limit}"
+                ),
+                None,
+            )
+        };
+
+        let mut stmt = binding.prepare(&sql)?;
+        // The two query_map calls use closures of different types, so they
+        // cannot share an if/else expression; drain each branch separately.
+        let mut out = Vec::new();
+        if let Some(ref p) = param {
+            let iter = stmt.query_map(params![p], |r| Self::row_to_deletion_log(r))?;
+            for item in iter {
+                out.push(item?);
+            }
+        } else {
+            let iter = stmt.query_map([], |r| Self::row_to_deletion_log(r))?;
+            for item in iter {
+                out.push(item?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn row_to_deletion_log(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::RetentionDeletionLog, rusqlite::Error> {
+        let purged_at = Self::parse_rfc3339_col(r, 3)?;
+        let details_str: Option<String> = r.get(5)?;
+        let details = details_str.and_then(|s| serde_json::from_str(&s).ok());
+        Ok(crate::models::RetentionDeletionLog {
+            id: r.get(0)?,
+            data_type: r.get(1)?,
+            deleted_rows: r.get::<_, i64>(2)? as u64,
+            purged_at,
+            actor: r.get(4)?,
+            details,
+        })
+    }
+
+    // ── #101: Encryption key version metadata ────────────────────────────────
+
+    /// Record a new encryption key version as active, retiring the previous one.
+    pub fn insert_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Mark any previously active key as 'retiring'.
+        self.conn.lock().unwrap().execute(
+            "UPDATE encryption_key_versions SET status = 'retiring' WHERE status = 'active'",
+            [],
+        )?;
+        self.conn.lock().unwrap().execute(
+            r"INSERT OR IGNORE INTO encryption_key_versions (version, status, created_at)
+               VALUES (?1, 'active', ?2)",
+            params![version as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// List all known key versions ordered by version number.
+    pub fn list_encryption_key_versions(
+        &self,
+    ) -> Result<Vec<crate::models::EncryptionKeyInfo>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT version, status, created_at, rotated_at
+               FROM encryption_key_versions ORDER BY version DESC",
+        )?;
+        let iter = stmt.query_map([], |r| {
+            use crate::models::EncryptionKeyStatus;
+            let status_str: String = r.get(1)?;
+            let status = match status_str.as_str() {
+                "active" => EncryptionKeyStatus::Active,
+                "retiring" => EncryptionKeyStatus::Retiring,
+                _ => EncryptionKeyStatus::Retired,
+            };
+            let created_at = Self::parse_rfc3339_col(r, 2)?;
+            let rotated_at_str: Option<String> = r.get(3)?;
+            let rotated_at = rotated_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            Ok(crate::models::EncryptionKeyInfo {
+                version: r.get::<_, i64>(0)? as u32,
+                status,
+                created_at,
+                rotated_at,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Mark a key version as fully retired.
+    pub fn retire_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "UPDATE encryption_key_versions SET status = 'retired', rotated_at = ?1 WHERE version = ?2",
+            params![now, version as i64],
+        )?;
+        Ok(())
+    }
+
+    // ── #103: Secret Rotation Policies ──────────────────────────────────────
+
+    /// Insert or replace a secret rotation policy.
+    pub fn upsert_secret_rotation_policy(
+        &self,
+        policy: &crate::models::SecretRotationPolicy,
+    ) -> Result<(), rusqlite::Error> {
+        let secret_type = serde_json::to_string(&policy.secret_type).unwrap();
+        let channels_json = serde_json::to_string(&policy.notify_channels).unwrap();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO secret_rotation_policies
+                (secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                 notify_channels, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              ON CONFLICT(secret_type) DO UPDATE SET
+                rotation_interval_days = excluded.rotation_interval_days,
+                grace_period_hours     = excluded.grace_period_hours,
+                auto_rotate            = excluded.auto_rotate,
+                notify_channels        = excluded.notify_channels,
+                updated_at             = excluded.updated_at",
+            params![
+                secret_type,
+                policy.rotation_interval_days as i64,
+                policy.grace_period_hours as i64,
+                if policy.auto_rotate { 1i64 } else { 0i64 },
+                channels_json,
+                policy.created_at.to_rfc3339(),
+                policy.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a rotation policy for a specific secret type.
+    pub fn get_secret_rotation_policy(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<Option<crate::models::SecretRotationPolicy>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                     notify_channels, created_at, updated_at
+               FROM secret_rotation_policies WHERE secret_type = ?1",
+        )?;
+        match stmt.query_row(params![secret_type_str], |r| {
+            Self::row_to_rotation_policy(r)
+        }) {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all secret rotation policies.
+    pub fn list_secret_rotation_policies(
+        &self,
+    ) -> Result<Vec<crate::models::SecretRotationPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                     notify_channels, created_at, updated_at
+               FROM secret_rotation_policies ORDER BY secret_type",
+        )?;
+        let iter = stmt.query_map([], |r| Self::row_to_rotation_policy(r))?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_rotation_policy(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::SecretRotationPolicy, rusqlite::Error> {
+        let secret_type_str: String = r.get(0)?;
+        let secret_type: crate::models::SecretType = serde_json::from_str(&secret_type_str)
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let auto_rotate_i: i64 = r.get(3)?;
+        let channels_str: String = r.get(4)?;
+        let notify_channels: Vec<String> = serde_json::from_str(&channels_str).unwrap_or_default();
+        let created_at = Self::parse_rfc3339_col(r, 5)?;
+        let updated_at = Self::parse_rfc3339_col(r, 6)?;
+        Ok(crate::models::SecretRotationPolicy {
+            secret_type,
+            rotation_interval_days: r.get::<_, i64>(1)? as u32,
+            grace_period_hours: r.get::<_, i64>(2)? as u32,
+            auto_rotate: auto_rotate_i != 0,
+            notify_channels,
+            created_at,
+            updated_at,
+        })
+    }
+
+    /// Record a rotation event for a secret.
+    pub fn log_secret_rotation(
+        &self,
+        log: &crate::models::SecretRotationLog,
+    ) -> Result<(), rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(&log.secret_type).unwrap();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO secret_rotation_logs
+                (secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                secret_type_str,
+                log.rotated_at.to_rfc3339(),
+                log.actor,
+                if log.grace_period_active { 1i64 } else { 0i64 },
+                log.grace_period_ends_at.map(|d| d.to_rfc3339()),
+                log.notes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the most recent rotation log entry for a secret type.
+    pub fn get_last_secret_rotation(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<Option<crate::models::SecretRotationLog>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
+               FROM secret_rotation_logs WHERE secret_type = ?1
+               ORDER BY rotated_at DESC LIMIT 1",
+        )?;
+        match stmt.query_row(params![secret_type_str], |r| Self::row_to_rotation_log(r)) {
+            Ok(l) => Ok(Some(l)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List rotation history for a secret type, most recent first.
+    pub fn list_secret_rotation_logs(
+        &self,
+        secret_type: &crate::models::SecretType,
+        limit: u32,
+    ) -> Result<Vec<crate::models::SecretRotationLog>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
+               FROM secret_rotation_logs WHERE secret_type = ?1
+               ORDER BY rotated_at DESC LIMIT ?2",
+        )?;
+        let iter = stmt.query_map(params![secret_type_str, limit as i64], |r| {
+            Self::row_to_rotation_log(r)
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_rotation_log(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::SecretRotationLog, rusqlite::Error> {
+        let secret_type_str: String = r.get(1)?;
+        let secret_type: crate::models::SecretType = serde_json::from_str(&secret_type_str)
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let rotated_at = Self::parse_rfc3339_col(r, 2)?;
+        let grace_period_active_i: i64 = r.get(4)?;
+        let grace_period_ends_at_str: Option<String> = r.get(5)?;
+        let grace_period_ends_at = grace_period_ends_at_str.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+        Ok(crate::models::SecretRotationLog {
+            id: r.get(0)?,
+            secret_type,
+            rotated_at,
+            actor: r.get(3)?,
+            grace_period_active: grace_period_active_i != 0,
+            grace_period_ends_at,
+            notes: r.get(6)?,
+        })
+    }
+
+    /// Build a rotation status summary for a given secret type.
+    pub fn get_secret_rotation_status(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<crate::models::SecretRotationStatus, rusqlite::Error> {
+        use chrono::Duration;
+        let policy = self.get_secret_rotation_policy(secret_type)?;
+        let last = self.get_last_secret_rotation(secret_type)?;
+        let now = chrono::Utc::now();
+
+        let (next_due, is_overdue) = if let (Some(ref p), Some(ref l)) = (&policy, &last) {
+            let next = l.rotated_at + Duration::days(i64::from(p.rotation_interval_days));
+            (Some(next), next < now)
+        } else if let Some(ref p) = policy {
+            // Never rotated — overdue immediately if interval > 0.
+            let overdue = p.rotation_interval_days > 0;
+            (None, overdue)
+        } else {
+            (None, false)
+        };
+
+        let (grace_active, grace_ends) = if let Some(ref l) = last {
+            (
+                l.grace_period_active && l.grace_period_ends_at.is_some_and(|d| d > now),
+                l.grace_period_ends_at,
+            )
+        } else {
+            (false, None)
+        };
+
+        Ok(crate::models::SecretRotationStatus {
+            secret_type: secret_type.clone(),
+            last_rotated_at: last.as_ref().map(|l| l.rotated_at),
+            next_rotation_due: next_due,
+            is_overdue,
+            grace_period_active: grace_active,
+            grace_period_ends_at: grace_ends,
+        })
+    }
+
+    // ── Shared RFC-3339 parse helper ─────────────────────────────────────────
+
+    fn parse_rfc3339_col(
+        r: &rusqlite::Row<'_>,
+        col: usize,
+    ) -> Result<chrono::DateTime<chrono::Utc>, rusqlite::Error> {
+        let s: String = r.get(col)?;
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    col,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    }
+}
+
+// ── Graceful degradation: capability status management ───────────────────────
+
+impl Db {
+    /// Store or update a capability's degradation status in the database.
+    /// All instances in a load-balanced deployment read from this shared store.
+    pub fn set_capability_status(
+        &self,
+        status: &crate::degradation::CapabilityStatus,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO capability_statuses (name, level, reason, fallback_available, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(name) DO UPDATE SET
+              level = excluded.level,
+              reason = excluded.reason,
+              fallback_available = excluded.fallback_available,
+              updated_at = excluded.updated_at
+            ",
+            rusqlite::params![
+                &status.name,
+                serde_json::to_string(&status.level).unwrap(),
+                &status.reason,
+                status.fallback_available as i32,
+                status.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a capability's registered status (used when a capability is
+    /// restored to `Full`, so `check` falls back to the default).
+    pub fn delete_capability_status(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM capability_statuses WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Look up a capability's status, returning `Full` (default) if not found.
+    pub fn get_capability_status(
+        &self,
+        name: &str,
+    ) -> Result<crate::degradation::CapabilityStatus, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, level, reason, fallback_available, updated_at 
+             FROM capability_statuses 
+             WHERE name = ?1",
+        )?;
+
+        let status = stmt.query_row(rusqlite::params![name], |r| {
+            let level_str: String = r.get(1)?;
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
+            Ok(crate::degradation::CapabilityStatus {
+                name: r.get(0)?,
+                level,
+                reason: r.get(2)?,
+                fallback_available: r.get::<_, i32>(3)? != 0,
+                updated_at: {
+                    let updated_str: String = r.get(4)?;
+                    chrono::DateTime::parse_from_rfc3339(&updated_str)
+                        .ok()
+                        .and_then(|dt| Some(dt.with_timezone(&chrono::Utc)))
+                        .unwrap_or_else(|| chrono::Utc::now())
+                },
+            })
+        });
+
+        match status {
+            Ok(s) => Ok(s),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Default to Full for unregistered capabilities
+                Ok(crate::degradation::CapabilityStatus {
+                    name: name.to_string(),
+                    level: crate::degradation::DegradationLevel::Full,
+                    reason: None,
+                    fallback_available: false,
+                    updated_at: chrono::Utc::now(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all registered (non-default) capability statuses.
+    pub fn list_capability_statuses(
+        &self,
+    ) -> Result<Vec<crate::degradation::CapabilityStatus>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, level, reason, fallback_available, updated_at 
+             FROM capability_statuses
+             ORDER BY updated_at DESC",
+        )?;
+
+        let statuses = stmt.query_map([], |r| {
+            let level_str: String = r.get(1)?;
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
+            Ok(crate::degradation::CapabilityStatus {
+                name: r.get(0)?,
+                level,
+                reason: r.get(2)?,
+                fallback_available: r.get::<_, i32>(3)? != 0,
+                updated_at: {
+                    let updated_str: String = r.get(4)?;
+                    chrono::DateTime::parse_from_rfc3339(&updated_str)
+                        .ok()
+                        .and_then(|dt| Some(dt.with_timezone(&chrono::Utc)))
+                        .unwrap_or_else(|| chrono::Utc::now())
+                },
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in statuses {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+}
+
+// ── Consistency pragma helpers (#83) ─────────────────────────────────────────
+
+impl Db {
+    /// Expose an `MutexGuard<Connection>` so that callers outside this module
+    /// (e.g. `consistency.rs`) can execute one-off queries without going through
+    /// individual `Db` methods.
+    pub fn conn_lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap()
+    }
+
+    /// Run SQLite's `PRAGMA foreign_key_check` and return one descriptive
+    /// string per violation.  Returns an empty `Vec` if the database is
+    /// clean.
+    pub fn run_consistency_pragma(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let rows = stmt.query_map([], |r| {
+            // Columns: table, rowid, parent, fkid
+            let table: String = r.get(0)?;
+            let rowid: i64 = r.get(1)?;
+            let parent: String = r.get(2)?;
+            let fkid: i64 = r.get(3)?;
+            Ok(format!(
+                "table={table} rowid={rowid} parent={parent} fkid={fkid}"
+            ))
+        })?;
+
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row?);
+        }
+        Ok(violations)
+    }
+}
+
+// ── Event sourcing persistence (#267) ────────────────────────────────────────
+
+impl Db {
+    /// Persist an event to the database.
+    pub fn append_event(
+        &self,
+        vault_id: &str,
+        sequence: u64,
+        event_type: &str,
+        timestamp: &chrono::DateTime<chrono::Utc>,
+        data: &str,
+        schema_version: u32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO events (vault_id, sequence, event_type, timestamp, data, schema_version)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            rusqlite::params![
+                vault_id,
+                sequence as i64,
+                event_type,
+                timestamp.to_rfc3339(),
+                data,
+                schema_version as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve all events for a vault, ordered by sequence.
+    pub fn get_events_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<(u64, String, String, String, u32)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT sequence, event_type, timestamp, data, schema_version
+            FROM events
+            WHERE vault_id = ?1
+            ORDER BY sequence ASC
+            ",
+        )?;
+
+        let events = stmt.query_map(rusqlite::params![vault_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i64>(4)? as u32,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for event in events {
+            result.push(event?);
+        }
+        Ok(result)
+    }
+
+    /// Save a snapshot for a vault.
+    pub fn save_snapshot(
+        &self,
+        vault_id: &str,
+        snapshot_sequence: u64,
+        taken_at: &chrono::DateTime<chrono::Utc>,
+        state: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              snapshot_sequence = excluded.snapshot_sequence,
+              taken_at = excluded.taken_at,
+              state = excluded.state
+            ",
+            rusqlite::params![
+                vault_id,
+                snapshot_sequence as i64,
+                taken_at.to_rfc3339(),
+                state
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the snapshot for a vault, if any.
+    pub fn get_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT snapshot_sequence, taken_at, state
+            FROM snapshots
+            WHERE vault_id = ?1
+            ",
+        )?;
+
+        stmt.query_row(rusqlite::params![vault_id], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+    }
+
+    /// Delete snapshots older than a given date (for retention/archival).
+    pub fn delete_old_snapshots(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM snapshots WHERE taken_at < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
+    }
+
+    /// Delete events older than a given date (for retention/archival).
+    pub fn delete_old_events(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
+    }
+}
+
+// ── Feature flag persistence (#274) ──────────────────────────────────────────
+
+impl Db {
+    /// Insert a brand-new flag row.  Callers must ensure the key does not
+    /// already exist; use `upsert_feature_flag` for create-or-update.
+    fn insert_feature_flag(
+        &self,
+        flag: &crate::feature_flags::FeatureFlag,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO feature_flags
+                (key, description, enabled, rollout_percentage, version, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                flag.key,
+                flag.description,
+                flag.enabled as i64,
+                flag.rollout_percentage as i64,
+                flag.version as i64,
+                flag.created_at.to_rfc3339(),
+                flag.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Create or update a feature flag.  If the flag already exists the old
+    /// state is written to `feature_flag_history` before the row is updated,
+    /// preserving a complete audit trail across restarts and instances.
+    ///
+    /// Returns the resulting flag (with incremented version on update).
+    pub fn upsert_feature_flag(
+        &self,
+        req: &crate::feature_flags::UpsertFlagRequest,
+    ) -> Result<crate::feature_flags::FeatureFlag, rusqlite::Error> {
+        let now = chrono::Utc::now();
+
+        match self.get_feature_flag(&req.key)? {
+            Some(existing) => {
+                // Snapshot the old state into history.
+                self.conn.lock().unwrap().execute(
+                    r"INSERT INTO feature_flag_history
+                        (flag_key, version, enabled, rollout_percentage, updated_at, updated_by)
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        existing.key,
+                        existing.version as i64,
+                        existing.enabled as i64,
+                        existing.rollout_percentage as i64,
+                        existing.updated_at.to_rfc3339(),
+                        req.updated_by,
+                    ],
+                )?;
+
+                let new_version = existing.version + 1;
+                let new_description = req
+                    .description
+                    .clone()
+                    .or_else(|| existing.description.clone());
+
+                self.conn.lock().unwrap().execute(
+                    r"UPDATE feature_flags
+                         SET description = ?1,
+                             enabled = ?2,
+                             rollout_percentage = ?3,
+                             version = ?4,
+                             updated_at = ?5
+                       WHERE key = ?6",
+                    rusqlite::params![
+                        new_description,
+                        req.enabled as i64,
+                        req.rollout_percentage as i64,
+                        new_version as i64,
+                        now.to_rfc3339(),
+                        req.key,
+                    ],
+                )?;
+
+                Ok(crate::feature_flags::FeatureFlag {
+                    key: req.key.clone(),
+                    description: new_description,
+                    enabled: req.enabled,
+                    rollout_percentage: req.rollout_percentage,
+                    version: new_version,
+                    created_at: existing.created_at,
+                    updated_at: now,
+                    history: self.get_feature_flag_history(&req.key)?,
+                })
+            }
+            None => {
+                let flag = crate::feature_flags::FeatureFlag {
+                    key: req.key.clone(),
+                    description: req.description.clone(),
+                    enabled: req.enabled,
+                    rollout_percentage: req.rollout_percentage,
+                    version: 1,
+                    created_at: now,
+                    updated_at: now,
+                    history: Vec::new(),
+                };
+                self.insert_feature_flag(&flag)?;
+                Ok(flag)
+            }
+        }
+    }
+
+    /// Fetch a single feature flag by key, including its history.
+    /// Returns `None` if the key does not exist.
+    pub fn get_feature_flag(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
+        // Collect the flag row into owned values inside a scoped block so the
+        // mutex guard is released before we call get_feature_flag_history,
+        // which also needs to acquire the lock.
+        let maybe_flag = {
+            let binding = self.conn.lock().unwrap();
+            let mut stmt = binding.prepare(
+                r"SELECT key, description, enabled, rollout_percentage, version, created_at, updated_at
+                   FROM feature_flags WHERE key = ?1",
+            )?;
+            let row = stmt.query_row(rusqlite::params![key], |r| {
+                let created_at = {
+                    let s: String = r.get(5)?;
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?
+                };
+                let updated_at = {
+                    let s: String = r.get(6)?;
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?
+                };
+                let enabled_i: i64 = r.get(2)?;
+                Ok(crate::feature_flags::FeatureFlag {
+                    key: r.get(0)?,
+                    description: r.get(1)?,
+                    enabled: enabled_i != 0,
+                    rollout_percentage: r.get::<_, i64>(3)? as u8,
+                    version: r.get::<_, i64>(4)? as u32,
+                    created_at,
+                    updated_at,
+                    history: Vec::new(), // populated after the lock is released
+                })
+            });
+            match row {
+                Ok(flag) => Some(flag),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e),
+            }
+        }; // mutex guard dropped here
+
+        match maybe_flag {
+            Some(mut flag) => {
+                flag.history = self.get_feature_flag_history(&flag.key)?;
+                Ok(Some(flag))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all feature flags, each with its full history.
+    pub fn list_feature_flags(
+        &self,
+    ) -> Result<Vec<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
+        let keys: Vec<String> = {
+            let binding = self.conn.lock().unwrap();
+            let mut stmt = binding.prepare("SELECT key FROM feature_flags ORDER BY key")?;
+            let iter = stmt.query_map([], |r| r.get(0))?;
+            let mut keys = Vec::new();
+            for k in iter {
+                keys.push(k?);
+            }
+            keys
+        };
+
+        let mut out = Vec::new();
+        for key in &keys {
+            if let Some(flag) = self.get_feature_flag(key)? {
+                out.push(flag);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Retrieve the ordered version history for a flag (oldest first).
+    pub fn get_feature_flag_history(
+        &self,
+        key: &str,
+    ) -> Result<Vec<crate::feature_flags::FlagVersionSnapshot>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT version, enabled, rollout_percentage, updated_at, updated_by
+               FROM feature_flag_history
+               WHERE flag_key = ?1
+               ORDER BY id ASC",
+        )?;
+        let iter = stmt.query_map(rusqlite::params![key], |r| {
+            let updated_at = {
+                let s: String = r.get(3)?;
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+            };
+            let enabled_i: i64 = r.get(1)?;
+            Ok(crate::feature_flags::FlagVersionSnapshot {
+                version: r.get::<_, i64>(0)? as u32,
+                enabled: enabled_i != 0,
+                rollout_percentage: r.get::<_, i64>(2)? as u8,
+                updated_at,
+                updated_by: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
     }
 }
 
@@ -1935,5 +3381,82 @@ mod tests {
         assert_eq!(result.vaults.len(), 10);
         assert_eq!(result.total, 25);
         assert_eq!(result.page, 2);
+    }
+
+    fn make_test_vault(id: &str) -> Vault {
+        Vault {
+            id: id.to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "ben1".to_string(),
+            balance: 1_000_000,
+            check_in_interval: 86_400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(100_000),
+        }
+    }
+
+    #[test]
+    fn test_get_vault_survives_db_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_restart_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+        let vault = make_test_vault("restart-vault");
+
+        {
+            let db = Db::open(path_str).unwrap();
+            db.migrate().unwrap();
+            db.insert_vault(vault.clone());
+        }
+
+        // Re-open against the same file, simulating a process restart.
+        let db = Db::open(path_str).unwrap();
+        db.migrate().unwrap();
+        let reloaded = db
+            .get_vault(&vault.id)
+            .expect("vault should survive db restart");
+        assert_eq!(reloaded.id, vault.id);
+        assert_eq!(reloaded.owner, vault.owner);
+        assert_eq!(reloaded.balance, vault.balance);
+        assert_eq!(reloaded.status, vault.status);
+        assert_eq!(reloaded.ttl_remaining, vault.ttl_remaining);
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_get_vault_visible_across_db_handles() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_multi_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        // Two independent `Db` handles on the same file, simulating two
+        // instances sharing a database behind a load balancer.
+        let db_a = Db::open(path_str).unwrap();
+        db_a.migrate().unwrap();
+        let db_b = Db::open(path_str).unwrap();
+        db_b.migrate().unwrap();
+
+        let vault = make_test_vault("shared-vault");
+        db_a.insert_vault(vault.clone());
+        let seen_by_b = db_b
+            .get_vault(&vault.id)
+            .expect("handle B should see a vault inserted through handle A");
+        assert_eq!(seen_by_b.owner, vault.owner);
+
+        let mut vault2 = vault.clone();
+        vault2.id = "shared-vault-2".to_string();
+        db_b.insert_vault(vault2.clone());
+        let seen_by_a = db_a
+            .get_vault(&vault2.id)
+            .expect("handle A should see a vault inserted through handle B");
+        assert_eq!(seen_by_a.id, vault2.id);
+
+        let _ = std::fs::remove_file(path_str);
     }
 }

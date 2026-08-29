@@ -369,7 +369,10 @@ fn test_vote_after_resolution_panics() {
     for oracle in oracles.iter() {
         client.vote_on_dispute(&dispute_id, &oracle, &true);
     }
-    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::Upheld);
+    assert_eq!(
+        client.get_dispute(&dispute_id).status,
+        DisputeStatus::Upheld
+    );
 
     // A fourth registered oracle tries to vote after resolution.
     let late_oracle = Address::generate(&env);
@@ -478,7 +481,10 @@ fn test_admin_configurable_dispute_threshold() {
     let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
 
     client.vote_on_dispute(&dispute_id, &oracle, &true);
-    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::Upheld);
+    assert_eq!(
+        client.get_dispute(&dispute_id).status,
+        DisputeStatus::Upheld
+    );
 }
 
 /// A zero threshold is rejected.
@@ -697,7 +703,10 @@ fn test_credential_privacy_defaults_to_public() {
     let claim = bytes!(&env, 0xcafebabe);
     let credential_id = client.attest(&oracle, &proof, &claim);
 
-    assert_eq!(client.credential_privacy(&credential_id), PrivacyLevel::Public);
+    assert_eq!(
+        client.credential_privacy(&credential_id),
+        PrivacyLevel::Public
+    );
 
     let stranger = Address::generate(&env);
     assert!(client
@@ -1036,7 +1045,10 @@ fn test_root_credential_has_no_parent() {
     let credential_id = client.attest(&oracle, &proof, &claim);
 
     assert!(client.get_credential_parent(&credential_id).is_none());
-    assert_eq!(client.get_credential_chain(&credential_id), vec![&env, credential_id]);
+    assert_eq!(
+        client.get_credential_chain(&credential_id),
+        vec![&env, credential_id]
+    );
     assert!(client.is_credential_chain_valid(&credential_id));
 }
 
@@ -1134,7 +1146,12 @@ fn test_create_derived_credential_invalidated_parent_panics() {
     }
     assert!(client.is_credential_invalidated(&parent_id));
 
-    client.create_derived_credential(&attester, &parent_id, &bytes!(&env, 0x03), &bytes!(&env, 0x04));
+    client.create_derived_credential(
+        &attester,
+        &parent_id,
+        &bytes!(&env, 0x03),
+        &bytes!(&env, 0x04),
+    );
 }
 
 /// Recursive validation: the immediate parent is itself valid, but an
@@ -1276,8 +1293,7 @@ fn test_is_credential_chain_valid_reflects_ancestor_invalidation() {
     assert!(client.is_credential_chain_valid(&child_id));
 
     let initiator = Address::generate(&env);
-    let dispute_id =
-        client.initiate_credential_dispute(&root_id, &initiator, &bytes!(&env, 0xaa));
+    let dispute_id = client.initiate_credential_dispute(&root_id, &initiator, &bytes!(&env, 0xaa));
     for oracle in oracles.iter() {
         client.vote_on_dispute(&dispute_id, &oracle, &true);
     }

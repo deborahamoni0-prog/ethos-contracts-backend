@@ -216,3 +216,108 @@ extended on every write).
 | Code | Variant | Description |
 |---|---|---|
 | 114 | `RuleNotFound` | `set_rule_enabled` called with unknown `rule_id` |
+
+---
+
+## Issue #35 — Slice Failover Mechanism
+
+### Motivation
+
+A slice that relies on a single primary attestor/provider has no recovery path
+when that primary fails.  The failover mechanism lets operators pre-register
+backup slices and have the contract automatically promote a backup when the
+primary accumulates too many recorded failures.
+
+### How Failover Works
+
+1. **Register** — the vault owner calls `register_backup_slice`, associating a
+   `backup_slice_id` with a `primary_slice_id` and a `failure_threshold`.
+2. **Record** — whenever the primary fails to respond correctly, the owner calls
+   `record_slice_failure`.  The contract increments an on-chain counter.
+3. **Auto-promote** — once the failure count reaches `failure_threshold`, the
+   backup is promoted atomically: `ActiveSlice(primary_id)` is set to
+   `backup_slice_id` and a `fail_act` event is emitted.
+4. **Query** — any caller can read the currently active slice with
+   `get_active_slice(primary_id)`.  Returns `primary_id` if no failover is
+   active, or `backup_slice_id` if failover has been triggered.
+5. **Revert** — when the primary is restored, the owner calls `revert_failover`.
+   The active slice reverts to `primary_id` and the failure counter is reset to
+   zero.
+
+Multiple backups may be registered for the same primary (ordered list); the
+contract uses the **first registered backup** for auto-promotion and explicit
+activate calls.
+
+### Authorization
+
+All state-mutating operations require the caller to be the **vault owner**.
+Attempting any mutating call from a different address panics with `NotOwner`.
+Read-only queries (`get_backup_slices`, `get_active_slice`, `get_failure_count`)
+require no authorization.
+
+### Contract API
+
+| Function | Auth | Description |
+|---|---|---|
+| `register_backup_slice(vault_id, caller, primary_slice_id, backup_slice_id, failure_threshold)` | owner | Register a backup and its threshold |
+| `record_slice_failure(vault_id, caller, primary_slice_id, reason)` | owner | Record one failure; returns `true` when failover activates |
+| `activate_failover(vault_id, caller, primary_slice_id, backup_slice_id, reason)` | owner | Force-promote backup without waiting for threshold |
+| `revert_failover(vault_id, caller, primary_slice_id, backup_slice_id)` | owner | Restore primary and reset failure counter |
+| `get_backup_slices(primary_slice_id)` | — | List registered backup slice IDs |
+| `get_active_slice(slice_id)` | — | Current active slice (`slice_id` when healthy) |
+| `get_failure_count(slice_id)` | — | Accumulated failure count |
+
+### `FailoverReason` Values
+
+| Variant | When to use |
+|---|---|
+| `ThresholdExceeded` | Failure counter crossed the configured threshold |
+| `ExplicitFailure` | Primary explicitly marked as failed by operator |
+| `Timeout` | Primary stopped responding within the expected window |
+
+### Events
+
+| Topic | Payload | When |
+|---|---|---|
+| `bkup_reg` | `FailoverEvent { event_type: Registered }` | After `register_backup_slice` |
+| `fail_act` | `FailoverActivatedEvent` | Failover becomes active (auto or explicit) |
+| `fail_rev` | `FailoverRevertedEvent` | Failover reverted to primary |
+| `fail_evt` | `FailoverEvent { event_type: Activated \| Reverted \| FailureRecorded }` | Generic audit trail event |
+
+### Storage Keys
+
+| Key | Type | Description |
+|---|---|---|
+| `SliceFailoverKey::BackupSlices(primary_id)` | `Vec<u64>` | Ordered backup slice IDs |
+| `SliceFailoverKey::ActiveSlice(primary_id)` | `u64` | Current active slice |
+| `SliceFailoverKey::FailoverConfig(primary_id, backup_id)` | `FailoverConfig` | Per-pair config and state |
+| `SliceFailoverKey::FailureCount(slice_id)` | `u32` | Accumulated failure count |
+| `SliceFailoverKey::LastFailureTime(slice_id)` | `u64` | Ledger timestamp of last failure |
+
+### Error Codes
+
+| Code | Variant | Description |
+|---|---|---|
+| 6 | `NotOwner` | Caller is not the vault owner |
+| 116 | `InvalidSlice` | `primary_slice_id == backup_slice_id` |
+
+### Example
+
+```rust
+// 1. Register a backup for slice 1, activate after 3 failures
+contract.register_backup_slice(vault_id, owner, 1, 2, 3);
+
+// 2. Primary slice 1 starts failing — record each failure
+contract.record_slice_failure(vault_id, owner, 1, FailoverReason::Timeout); // count = 1
+contract.record_slice_failure(vault_id, owner, 1, FailoverReason::Timeout); // count = 2
+let activated = contract.record_slice_failure(vault_id, owner, 1, FailoverReason::Timeout);
+// activated == true; count = 3 (== threshold)
+
+// 3. All traffic should now use slice 2
+assert_eq!(contract.get_active_slice(1), 2);
+
+// 4. Primary recovered — revert
+contract.revert_failover(vault_id, owner, 1, 2);
+assert_eq!(contract.get_active_slice(1), 1); // back to primary
+assert_eq!(contract.get_failure_count(1), 0); // counter reset
+```
