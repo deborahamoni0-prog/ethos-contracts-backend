@@ -95,3 +95,19 @@ client.exit_hibernation(&vault_id, &owner)?;
 - Hibernation does not affect deposits, withdrawals, or check-ins — those remain available.
 - A vault cannot enter hibernation twice simultaneously; the existing entry must expire or be exited first.
 - Hibernation duration is bounded by the same `max_ttl_seconds` constraint applied to check-ins (the combined `check_in_interval + duration_seconds` is used when computing storage TTL).
+
+## Verified Guarantees (State Consistency Tests)
+
+`contracts/ttl_vault/src/hibernation_consistency_tests.rs` exercises the hibernate → advance ledger clock → wake cycle and asserts the following, in addition to the end-to-end scenario already covered by `lifecycle_tests::test_full_lifecycle_with_hibernation`:
+
+- **TTL freeze is stable mid-window.** `is_expired` stays `false` and `get_hibernation` returns an unchanged `HibernationEntry` at any point strictly inside the hibernation window, even when elapsed time far exceeds what the normal `check_in_interval` alone would have allowed.
+- **Wake boundary grants a fresh interval.** The instant the hibernation window closes (`now == started_at + duration_seconds + 1`), the vault is not immediately expired — the owner is credited a full `check_in_interval` from the wake point, per the expiry formula in this document.
+- **Normal expiry resumes correctly post-wake.** Once the fresh post-wake interval elapses, `is_expired` returns `true` again, confirming the TTL machinery re-engages rather than staying permanently suspended.
+- **Early exit preserves the remaining TTL budget.** Exiting hibernation partway through the window clears the `HibernationEntry` and credits only the *elapsed* hibernation time, not the full duration, onto `last_check_in` — verified by checking the vault survives exactly one more `check_in_interval` from the exit point and no longer.
+- **Pending credential/admin transitions are isolated from hibernation.** A `propose_new_admin` timelock proposal spanning a concurrent vault's hibernation cycle is unaffected: `get_pending_admin` remains stable across the hibernation boundary and `accept_admin` succeeds once its own 24h timelock elapses, independent of the hibernating vault's TTL state (and vice versa).
+
+Run these tests with:
+
+```bash
+cargo test --package ttl-vault hibernation_consistency_tests
+```
