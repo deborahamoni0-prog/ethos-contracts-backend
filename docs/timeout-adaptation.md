@@ -47,6 +47,60 @@ manager.record_latency("get_vault", observed_duration);
 let timeout = manager.current_timeout("get_vault");
 ```
 
+## Convergence Characteristics
+
+Two independently-computed values respond to load differently, and it's
+worth knowing which one you're looking at:
+
+### `current_timeout` — bounded, then stable
+
+`current_timeout` is computed fresh on every call directly from whatever
+samples currently sit in the rolling window — it is **not** itself an
+exponential moving average, so it has no oscillation risk of its own. Under
+steady-state (constant) latency:
+
+- It converges in **exactly `min_samples` iterations** — the first call
+  where the window has at least `min_samples` observations returns a
+  timeout derived from the (now entirely steady-state) window contents.
+- It then holds **perfectly stable** for as long as the input stays
+  steady-state, since every sample in the window is identical and the
+  percentile of a constant window never changes.
+
+See `current_timeout_converges_within_min_samples_under_steady_state_load`
+in the test suite.
+
+### `predict_timeout` — EMA settles within its history window
+
+`predict_timeout` extrapolates from an exponential moving average
+(alpha = 0.3) over up to the last 20 recorded percentile values
+(`HISTORY_CAPACITY`), plus a linear trend term. Under steady-state input,
+the EMA is a fixed point (feeding it the same value repeatedly leaves it
+unchanged) and the trend term goes to zero, so the prediction converges to
+the steady-state latency — in practice within a couple of ms of the
+mathematically-exact value due to `Duration <-> f64` conversion rounding.
+See `predicted_timeout_converges_toward_steady_state_value`.
+
+### Spike + recovery
+
+A single latency spike immediately widens `current_timeout` (it shows up in
+the percentile as soon as it's recorded — no delay). Because the window is
+a fixed-size FIFO ring buffer, the spike is guaranteed to be fully evicted,
+and the timeout fully recovered to its pre-spike baseline, after at most
+`window_size` further steady-state samples — one full window rotation. It
+cannot recover any faster (the spike stays visible to the percentile
+calculation until it physically falls out of the window) and it never gets
+"stuck" wide (it's not a decaying average, so there's no long tail). See
+`timeout_widens_on_spike_then_recovers_once_it_ages_out_of_window`.
+
+### Known gap
+
+Both convergence properties above are exact given `multiplier = 1.0`.
+There's no dedicated test yet asserting the *rate* of `predict_timeout`'s
+EMA convergence when initialized from a very different value than the
+steady-state target (i.e. how many iterations until it's within X% after a
+regime change, as opposed to whether it eventually gets arbitrarily close)
+— worth adding if the EMA's alpha is ever tuned.
+
 ## Benchmarking
 
 There's no `criterion` dev-dependency in this workspace, so

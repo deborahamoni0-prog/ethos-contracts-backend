@@ -82,6 +82,33 @@ pub struct CreateRetryPolicyRequest {
     pub retry_on_status: Vec<u16>,
 }
 
+impl RetryPolicy {
+    /// Validates that this policy's backoff/jitter configuration is sane
+    /// before it's stored and used to compute real delays.
+    ///
+    /// `jitter` itself (`JitterMode`) is a closed enum with no numeric
+    /// fields, so it can't independently be "negative" or "out of bounds" —
+    /// but the parameters that feed the jittered delay computation
+    /// (`compute_backoff_delay`) can be, and a bad value there is exactly
+    /// what would produce a negative, zero-forever, or larger-than-interval
+    /// jitter window at runtime. This checks those.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_attempts == 0 {
+            return Err("max_attempts must be > 0".to_string());
+        }
+        if self.base_delay_ms > self.max_delay_ms {
+            return Err("base_delay_ms must be <= max_delay_ms".to_string());
+        }
+        if !self.multiplier.is_finite() || self.multiplier <= 0.0 {
+            return Err(format!(
+                "multiplier must be a finite positive number, got {}",
+                self.multiplier
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Computes the delay before attempt number `attempt` (1-indexed) using
 /// exponential backoff capped at `max_delay_ms`, with jitter applied.
 pub fn compute_backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
@@ -205,19 +232,6 @@ async fn create_retry_policy(
     State(state): State<RetryPolicyState>,
     Json(body): Json<CreateRetryPolicyRequest>,
 ) -> Result<(StatusCode, Json<RetryPolicy>), (StatusCode, String)> {
-    if body.max_attempts == 0 {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "max_attempts must be > 0".into(),
-        ));
-    }
-    if body.base_delay_ms > body.max_delay_ms {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "base_delay_ms must be <= max_delay_ms".into(),
-        ));
-    }
-
     let policy = RetryPolicy {
         id: uuid::Uuid::new_v4().to_string(),
         name: body.name,
@@ -230,6 +244,11 @@ async fn create_retry_policy(
         retry_on_status: body.retry_on_status,
         created_at: chrono::Utc::now(),
     };
+
+    policy
+        .validate()
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
     let saved = state.store.upsert(policy);
     Ok((StatusCode::CREATED, Json(saved)))
 }
@@ -296,6 +315,87 @@ mod tests {
         for attempt in 1..=6 {
             let delay = compute_backoff_delay(&policy, attempt);
             assert!(delay.as_millis() <= 2000);
+        }
+    }
+
+    #[test]
+    fn equal_jitter_stays_within_half_to_full_capped_delay() {
+        // Unlike full jitter (which can land anywhere in [0, capped]), equal
+        // jitter should never fall below half the capped delay, and never
+        // exceed it. Sampled repeatedly since jitter is randomized.
+        let policy = test_policy(JitterMode::Equal);
+        for attempt in 1..=6 {
+            let capped_ms = (policy.base_delay_ms as f64 * policy.multiplier.powi(attempt as i32 - 1))
+                .min(policy.max_delay_ms as f64);
+            for _ in 0..50 {
+                let delay_ms = compute_backoff_delay(&policy, attempt).as_millis() as f64;
+                assert!(
+                    delay_ms >= (capped_ms / 2.0).floor() && delay_ms <= capped_ms.ceil(),
+                    "attempt {attempt}: delay {delay_ms}ms outside expected [{}, {}] window",
+                    capped_ms / 2.0,
+                    capped_ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_jitter_mode_never_produces_negative_or_out_of_bounds_delay() {
+        let policy = test_policy(JitterMode::None);
+        for attempt in 1..=10 {
+            let delay = compute_backoff_delay(&policy, attempt);
+            assert!(delay.as_millis() <= policy.max_delay_ms as u128);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_sane_boundary_configurations() {
+        // multiplier == 1.0 (no growth, but still a sane, finite, positive
+        // value) and base_delay_ms == max_delay_ms (zero-width interval) are
+        // both edge cases that should be accepted, not rejected.
+        let mut policy = test_policy(JitterMode::None);
+        policy.multiplier = 1.0;
+        assert!(policy.validate().is_ok());
+
+        policy.base_delay_ms = policy.max_delay_ms;
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_attempts() {
+        let mut policy = test_policy(JitterMode::None);
+        policy.max_attempts = 0;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_base_delay_greater_than_max_delay() {
+        let mut policy = test_policy(JitterMode::None);
+        policy.base_delay_ms = policy.max_delay_ms + 1;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_multiplier() {
+        for bad in [0.0, -1.0, -0.5] {
+            let mut policy = test_policy(JitterMode::None);
+            policy.multiplier = bad;
+            assert!(
+                policy.validate().is_err(),
+                "multiplier {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_multiplier() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut policy = test_policy(JitterMode::None);
+            policy.multiplier = bad;
+            assert!(
+                policy.validate().is_err(),
+                "multiplier {bad} should be rejected"
+            );
         }
     }
 
