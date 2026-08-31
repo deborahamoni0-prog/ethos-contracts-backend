@@ -47,6 +47,29 @@ println!("hit ratio: {:?}", stats.hit_ratio());
 the separator character (`:`), preventing a malicious actor from crafting a
 tenant ID that crosses partition boundaries.
 
+### Consistent Hashing and Dynamic Rebalancing (#362)
+
+To avoid full cache flushes when partitions are added or removed, `PartitionedCache` integrates consistent hashing:
+
+- **`ConsistentHashRing`**: Distributes partition assignments over virtual nodes (default: 100 vnodes per partition) to guarantee uniform distribution and minimal key movement (~1/(N+1)).
+- **`add_partition_and_rebalance` / `remove_partition_and_rebalance` / `rebalance`**: Migrates only keys whose hash mapping moved to another partition, preserving untouched keys without cache flushes.
+- **`partition_load` / `hot_partitions`**: Tracks per-partition live keys and total operations (`hits + misses + sets`) to calculate load factors and detect hot partitions.
+
+```rust
+use std::time::Duration;
+use ethos_protocol_backend::cache_partition::PartitionedCache;
+
+let cache = PartitionedCache::with_consistent_partitions(&["part-1", "part-2"], Duration::from_secs(300));
+cache.set_routed("user:101", "profile_data".into());
+
+// Dynamically scale out partitions with minimal key migration
+let result = cache.add_partition_and_rebalance("part-3");
+println!("Migrated {} of {} keys", result.migrated_keys, result.total_keys);
+
+// Check for hot partitions
+let hot = cache.hot_partitions(1.5);
+```
+
 ---
 
 ## #93 — Cache Fault Recovery

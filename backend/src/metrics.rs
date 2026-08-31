@@ -109,6 +109,47 @@ pub(crate) fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(out, "{name} {value}");
 }
 
+/// Renders a Prometheus counter line with key-value labels (#364).
+pub fn push_labeled_counter(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labels: &[(&str, &str)],
+    value: u64,
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let label_str = labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = writeln!(out, "{name}{{{label_str}}} {value}");
+}
+
+/// Renders a Prometheus gauge line with key-value labels (#364).
+pub fn push_labeled_gauge(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labels: &[(&str, &str)],
+    value: u64,
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    let label_str = labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = writeln!(out, "{name}{{{label_str}}} {value}");
+}
+
+/// Append bulkhead registry metrics in Prometheus text format (#364).
+pub fn render_bulkhead_metrics(bulkheads: &crate::bulkhead::BulkheadRegistry) -> String {
+    bulkheads.render_prometheus()
+}
+
 fn push_gauge_i64(out: &mut String, name: &str, help: &str, value: i64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} gauge");
@@ -152,5 +193,41 @@ mod tests {
         assert!(output.contains("# HELP ethos_protocol_vaults_total"));
         assert!(output.contains("# TYPE ethos_protocol_vaults_total counter"));
         assert!(output.contains("# TYPE ethos_protocol_active_vaults gauge"));
+    }
+
+    #[test]
+    fn test_push_labeled_metrics() {
+        let mut out = String::new();
+        push_labeled_counter(
+            &mut out,
+            "bulkhead_rejected_total",
+            "Total rejected",
+            &[("endpoint", "/api/vaults")],
+            3,
+        );
+        push_labeled_gauge(
+            &mut out,
+            "bulkhead_active_permits",
+            "Active permits",
+            &[("endpoint", "/api/vaults")],
+            2,
+        );
+
+        assert!(out.contains("bulkhead_rejected_total{endpoint=\"/api/vaults\"} 3"));
+        assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 2"));
+    }
+
+    #[tokio::test]
+    async fn test_render_bulkhead_metrics_integration() {
+        let registry = crate::bulkhead::BulkheadRegistry::new(crate::bulkhead::BulkheadConfig {
+            max_concurrent: 5,
+            max_queue_size: 10,
+        });
+
+        let permit = registry.acquire("/api/keys/test").await.unwrap();
+        let rendered = render_bulkhead_metrics(&registry);
+        assert!(rendered.contains("bulkhead_active_permits{endpoint=\"/api/keys\"} 1"));
+        assert!(rendered.contains("bulkhead_queue_depth{endpoint=\"/api/keys\"} 0"));
+        drop(permit);
     }
 }

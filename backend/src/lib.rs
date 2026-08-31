@@ -5,6 +5,7 @@ pub mod backup_validation;
 pub mod batching;
 pub mod bulkhead;
 pub mod cache;
+pub mod cache_partition;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
