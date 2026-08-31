@@ -123,6 +123,8 @@ mod bps_invariant_tests;
 #[cfg(test)]
 mod composition_rules_tests;
 #[cfg(test)]
+mod hibernation_consistency_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;

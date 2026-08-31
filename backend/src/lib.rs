@@ -28,6 +28,8 @@ pub mod incidents;
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
+#[cfg(test)]
+mod migration_rollback_tests;
 pub mod models;
 pub mod multilevel_cache;
 pub mod notifications;
