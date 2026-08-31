@@ -40,6 +40,15 @@ jobs:
       - name: Run tests
         run: cargo test --package ttl-vault
 
+      - name: Compare benchmarks against baseline
+        run: python3 scripts/compare_bench_baseline.py
+
+      - name: Run backend cross-cutting integration tests
+        run: cargo test --package ethos-protocol-backend
+
+      - name: Run migration rollback tests (apply, rollback, re-apply)
+        run: cargo test --package ethos-protocol-backend migration_rollback
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

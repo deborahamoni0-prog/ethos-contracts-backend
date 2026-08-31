@@ -162,7 +162,12 @@ impl BulkheadRegistry {
             )
         };
 
-        if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+        // Fast path: a concurrency slot is immediately available, so this
+        // request never actually has to wait — it must not be gated by
+        // `max_queue_size`, which bounds the *wait queue*, not total
+        // concurrency. Without this, `max_queue_size: 0` would reject every
+        // request outright even with free concurrent slots.
+        if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
             metrics.active.fetch_add(1, Ordering::SeqCst);
             return Ok(BulkheadPermit {
                 _permit: permit,
@@ -170,6 +175,7 @@ impl BulkheadRegistry {
             });
         }
 
+        // No slot free: this request must wait, gated by the queue budget.
         let queued_now = metrics.queued.fetch_add(1, Ordering::SeqCst) + 1;
         if queued_now > max_queue_size {
             metrics.queued.fetch_sub(1, Ordering::SeqCst);

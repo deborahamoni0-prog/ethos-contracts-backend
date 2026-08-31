@@ -331,6 +331,45 @@ Times include network latency and ledger confirmation.
 6. **Test error paths**: Verify error handling works correctly
 7. **Monitor costs**: Track transaction fees to optimize
 
+## Cross-Cutting Backend Concerns (Auth + Rate Limiting + Caching)
+
+`backend/src/audit.rs` (auth + audit logging), `backend/src/cache.rs`
+(vault caching), and `backend/src/websocket.rs` (message rate limiting) each
+had unit-level test coverage, but nothing exercised how they behave when
+combined in a single request path. `backend/src/cross_cutting_integration_tests.rs`
+closes that gap with five scenarios:
+
+1. **Auth + caching** — a failed `authorize_admin` check must never warm the
+   `VaultCache`; only a successful check may populate it
+   (`test_auth_failure_does_not_populate_cache`).
+2. **Auth + rate limiting** — `MessageRateLimiter`'s per-second budget is
+   enforced identically regardless of any concurrent auth outcome, proving
+   the two concerns are not accidentally coupled
+   (`test_rate_limiter_enforces_budget_independent_of_auth_outcome`).
+3. **Auth + auditing** — both an authorized and an unauthorized attempt
+   against the same resource are durably recorded with the correct `result`
+   (`test_audit_log_distinguishes_authorized_and_unauthorized_attempts`).
+4. **Caching + rate limiting** — the cache's TTL clock and the rate
+   limiter's window clock run independently; expiring one does not affect
+   the other (`test_cache_ttl_and_rate_limiter_window_are_independent`).
+5. **Caching + auditing** — a state change invalidates the cache *and* is
+   recorded in the audit log together, so a read immediately after a write
+   never returns stale data while the audit trail still captures the change
+   (`test_cache_invalidation_on_state_change_is_reflected_and_audited`).
+
+Run locally with:
+
+```bash
+cargo test --package ethos-protocol-backend cross_cutting
+```
+
+These are unit-style tests (in-process `Db::open(":memory:")`, no testnet
+required) and run on every push/PR as part of the `ci` job's
+"Run backend cross-cutting integration tests" step in
+`.github/workflows/ci.yml` — alongside `Run tests` (contract tests) and
+`Compare benchmarks against baseline`, these three steps are required checks
+that must pass before a PR can merge.
+
 ## References
 
 - [Soroban Testing Guide](https://soroban.stellar.org/docs/learn/testing)

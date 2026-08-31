@@ -32,6 +32,10 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    incidents::{
+        add_timeline_entry, create_incident, escalate_incident, get_incident, list_incidents,
+        update_incident_status, IncidentState,
+    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -42,6 +46,7 @@ use ethos_protocol_backend::{
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
+    scheduler::SchedulerContext,
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
@@ -187,6 +192,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
         .route("/webhooks/verify", post(verify_webhook))
+        // ── Incident tracking routes (#373) ───────────────────────────────────
+        .route("/incidents", post(create_incident).get(list_incidents))
+        .route("/incidents/:id", get(get_incident))
+        .route("/incidents/:id/timeline", post(add_timeline_entry))
+        .route("/incidents/:id/status", post(update_incident_status))
+        .route("/incidents/:id/escalate", post(escalate_incident))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
@@ -284,11 +295,6 @@ async fn main() {
         "consensus cache initialized"
     );
 
-    let scheduler_db = Arc::clone(&db);
-    tokio::spawn(async move {
-        scheduler::run(scheduler_db).await;
-    });
-
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
@@ -322,6 +328,20 @@ async fn main() {
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
 
+    let incident_state = Arc::new(IncidentState::new());
+
+    // ── Background scheduler (reminders, TTL insurance, retention, secret
+    // rotation, consensus reconciliation (#373)) ──────────────────────────
+    let scheduler_ctx = SchedulerContext {
+        db: Arc::clone(&db),
+        consensus: Arc::clone(&consensus),
+        metrics: Arc::clone(&metrics),
+        incident_state: Arc::clone(&incident_state),
+    };
+    tokio::spawn(async move {
+        scheduler::run(scheduler_ctx).await;
+    });
+
     let state = AppState {
         db: Arc::clone(&db),
         vault_store,
@@ -345,6 +365,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        incident_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

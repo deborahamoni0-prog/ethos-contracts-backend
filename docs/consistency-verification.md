@@ -101,3 +101,41 @@ Log output:
 1. Add a `check_*` function to `ConsistencyChecker` in `consistency.rs`.
 2. Register it in the `check_fns` slice inside `run_all_checks`.
 3. Document it in this file with its severity level and the query it runs.
+
+## Distributed Cache Consensus Reconciliation
+
+Separate from the SQLite-focused checks above, `backend/src/consensus.rs`
+implements `ConsensusReport` / `ConflictDetail` for comparing a node's local
+cache against the shared `InMemoryBackend` / `RedisBackend` used for
+multi-node distributed-cache consensus (`NodeCache::check_and_resolve`).
+
+### Scheduled Job
+
+The scheduler (`scheduler.rs`) runs a consensus reconciliation job at most
+**every 5 minutes**. Unlike the SQLite consistency checks above, cache
+divergence between nodes can compound quickly (each node keeps serving
+stale reads until reconciled), so this job runs on a tighter cadence than
+the 6-hour SQLite checks or the hourly backup validation job.
+
+Each run:
+
+1. Calls `NodeCache::check_and_resolve()`, which diffs the local cache
+   against the distributed backend, resolves any conflicts per the
+   configured `ConflictStrategy` (`last_write_wins` or `voting`), and
+   returns a `ConsensusReport`.
+2. Publishes the result as Prometheus metrics on `/metrics`:
+   - `ethos_protocol_consensus_checks_total` (counter)
+   - `ethos_protocol_consensus_conflicts_total` (counter)
+   - `ethos_protocol_consensus_consistent` (gauge; 1 = consistent, 0 = conflicts found)
+3. When conflicts are found, opens an incident via `incidents.rs`
+   (`POST /incidents`-equivalent, severity `Sev3`) describing the affected
+   keys and how many conflicts were auto-resolved, so operators are
+   notified even if nobody is actively watching `/health/consensus` or
+   `/metrics`.
+
+### On-Demand Endpoint
+
+`GET /health/consensus` runs the same check synchronously and returns the
+current consistency status; it does not itself open an incident or update
+the scheduled-job metrics above (those are only touched by the periodic
+job).

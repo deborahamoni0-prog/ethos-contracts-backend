@@ -70,6 +70,70 @@ report.add(ChaosRunner::new(&partition_injector).run(100, resilient_op));
 assert!(report.all_passed());
 ```
 
+## Combined-Failure Scenarios (#370)
+
+Individual fault injectors are useful, but real incidents are rarely a
+single clean failure — they're usually several things going wrong at once.
+Two scenarios exercise that directly, composing chaos primitives with the
+actual reliability modules they're meant to protect rather than a
+standalone fake operation:
+
+### Cache down + one replica down → falls back, doesn't error
+
+`cascading_cache_and_replica_failure_falls_back_gracefully` marks two
+`NetworkPartitionSimulator` targets ("cache" and "replica-b") down
+simultaneously, leaving a third ("primary-db") healthy, then drives a
+`fallback::FallbackChain` through `fallback::cascade`. Findings:
+
+- The chain correctly skips both down targets and resolves on the healthy
+  one — `resolved_target` is `Some`, not an error, confirming
+  `fallback.rs`'s cascade behavior degrades gracefully instead of failing
+  the whole operation when the two highest-priority targets are both
+  unavailable at once.
+- `degraded` is correctly `true` (it didn't resolve on the first target),
+  distinguishing "worked, but not optimally" from "fully healthy" for
+  monitoring purposes.
+- Healing "cache" and re-running the cascade confirms recovery: the chain
+  resolves on the highest-priority target again and `degraded` flips back
+  to `false`.
+
+**Gap**: this scenario drives `fallback::cascade` directly with a
+synthetic chain; it doesn't yet exercise a real call site (e.g. webhook
+delivery or an RPC call) that's actually wired up to use a fallback chain
+in production. Worth adding once a concrete caller adopts
+`fallback::cascade` for cache/replica reads.
+
+### Circuit breaker + bulkhead under concurrent load
+
+`circuit_breaker_and_bulkhead_interact_under_load` spawns 20 concurrent
+tasks against a shared `BulkheadRegistry` (max 3 concurrent, queue of 4)
+and `CircuitBreaker` (opens after 4 consecutive failures), each task
+acquiring a bulkhead permit before making a call that always fails.
+Findings:
+
+- No panics or deadlocks under the combined concurrent load (a panic in
+  any spawned task would surface as a `join` error and fail the test
+  immediately).
+- The two mechanisms compose as expected: some calls are rejected by the
+  bulkhead before ever reaching the breaker (queue full), and — the
+  interesting part — once the breaker trips open, calls that *did* make it
+  past the bulkhead are still fast-rejected by the breaker without
+  invoking the (failing) operation again. The test asserts
+  `operation_invocations < bulkhead_permits_acquired` specifically to
+  isolate this: it's not enough for calls to fail overall, the breaker
+  must demonstrably short-circuit some of them.
+- Bulkhead accounting (`active` permits) returns to zero once every task
+  completes — no permit leak under combined failure + concurrency.
+
+**Gap**: this scenario calls `BulkheadRegistry::acquire` and
+`CircuitBreaker::call` directly; it doesn't run through the actual
+`bulkhead_middleware` Axum middleware layered onto real HTTP requests, so
+it doesn't catch issues specific to how the two are layered in
+`main.rs`'s router (ordering relative to other middleware, header
+propagation, etc.). A follow-up using `tower::ServiceExt::oneshot` against
+a real router (see the pattern in `backend/src/tests.rs`) would close that
+gap.
+
 ## Extending
 
 To add a new fault type, implement `FaultInjector` (`name`, `inject`,

@@ -20,13 +20,17 @@ pub mod dlq;
 pub mod error;
 pub mod error_context;
 pub mod event_sourcing;
+pub mod fallback;
 pub mod feature_flags;
 pub mod graphql;
 pub mod handlers;
 pub mod health_routing;
+pub mod incidents;
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
+#[cfg(test)]
+mod migration_rollback_tests;
 pub mod models;
 pub mod multilevel_cache;
 pub mod notifications;

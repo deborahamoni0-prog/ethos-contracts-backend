@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 mod atomic_release_tests;
+#[cfg(test)]
+mod recovery_tests;
 mod compression;
 
 use crate::compression::{
@@ -10,7 +12,7 @@ use crate::compression::{
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Bytes, Env, Map, String, Vec,
+    symbol_short, Address, Bytes, BytesN, Env, Map, String, Vec,
 };
 
 const MINT_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mint");
@@ -24,6 +26,15 @@ const METADATA_COMPRESSED_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mcmp")
 const FRACTIONAL_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("frac_crt");
 const ESCROW_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_crt");
 const ESCROW_RELEASED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_rel");
+const RECOVERY_CODES_GENERATED_TOPIC: soroban_sdk::Symbol = symbol_short!("rc_gen");
+const RECOVERY_SUCCEEDED_TOPIC: soroban_sdk::Symbol = symbol_short!("rc_ok");
+const RECOVERY_RATE_LIMITED_TOPIC: soroban_sdk::Symbol = symbol_short!("rc_rl");
+
+/// Number of one-time recovery codes issued per `generate_sbt_recovery_codes` call.
+pub const RECOVERY_CODE_COUNT: u32 = 5;
+/// Recovery attempts allowed per `RECOVERY_ATTEMPT_WINDOW_SECONDS` window, per SBT.
+pub const RECOVERY_MAX_ATTEMPTS: u32 = 5;
+pub const RECOVERY_ATTEMPT_WINDOW_SECONDS: u64 = 3600;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -81,6 +92,10 @@ pub enum SbtError {
     CredentialAlreadyReleased = 25,
     /// A credential id appears more than once in an atomic release batch.
     DuplicateCredentialId = 26,
+    /// No unused recovery codes exist for this SBT.
+    NoRecoveryCodes = 27,
+    /// Recovery attempts have exceeded the allowed rate for the current window.
+    RecoveryRateLimited = 28,
 }
 
 /// Storage key discriminants. All SBT state is keyed by `sbt_id`.
@@ -92,6 +107,7 @@ pub enum DataKey {
     Metadata(u64),
     MintedAt(u64),
     Composition(u64),
+    CompositionComponents(u64),
     SharedMetadata(u64),
     Delegation(u64),
     DelegationHistory(u64),
@@ -107,6 +123,10 @@ pub enum DataKey {
     NextEscrowId,
     /// Escrow history for auditing.
     EscrowHistory(u64),
+    /// sbt_id -> unused, hashed recovery codes (issue #51).
+    RecoveryCodes(u64),
+    /// sbt_id -> recovery attempt rate-limit state (issue #51).
+    RecoveryAttempts(u64),
 }
 
 /// A bridge record linking an SBT to a token on a standard (transferable) NFT
@@ -119,6 +139,13 @@ pub struct CompositionRecord {
     pub nft_address: Address,
     pub nft_id: u64,
     pub composed_at: u64,
+}
+
+/// Bounded local component references used when resolving composed ownership.
+#[contracttype]
+#[derive(Clone)]
+pub struct CompositionComponents {
+    pub component_ids: Vec<u64>,
 }
 
 #[contracttype]
@@ -193,6 +220,18 @@ pub enum EscrowStatus {
     Active,
     Released,
     Disputed,
+}
+
+/// Per-SBT recovery attempt rate-limit state (issue #51). Both successful
+/// and failed recovery attempts count toward `attempt_count` within a
+/// `RECOVERY_ATTEMPT_WINDOW_SECONDS` window starting at `window_start`, so
+/// brute-forcing a recovery code is bounded to `RECOVERY_MAX_ATTEMPTS`
+/// guesses per window.
+#[contracttype]
+#[derive(Clone)]
+pub struct RecoveryAttemptState {
+    pub attempt_count: u32,
+    pub window_start: u64,
 }
 
 /// A condition gating one leg of a conditional batch transfer.
@@ -617,6 +656,37 @@ impl SbtContract {
         env.storage().instance().get(&DataKey::Composition(sbt_id))
     }
 
+    /// Sets bounded local SBT components for an existing composition.
+    /// Components are validated as a graph before storage is updated.
+    pub fn set_composition_components(env: Env, sbt_id: u64, component_ids: Vec<u64>) {
+        Self::require_owner(&env, sbt_id);
+        if component_ids.is_empty() || Self::composition_reaches_any(&env, &component_ids, sbt_id) {
+            panic_with_error!(&env, SbtError::InvalidCompositionGraph);
+        }
+        for component_id in component_ids.iter() {
+            Self::load_owner(&env, *component_id);
+        }
+        env.storage().instance().set(
+            &DataKey::CompositionComponents(sbt_id),
+            &CompositionComponents { component_ids },
+        );
+    }
+
+    pub fn get_composition_components(env: Env, sbt_id: u64) -> Option<Vec<u64>> {
+        env.storage()
+            .instance()
+            .get::<DataKey, CompositionComponents>(&DataKey::CompositionComponents(sbt_id))
+            .map(|components| components.component_ids)
+    }
+
+    /// Resolves all reachable local components with a hard depth and cycle bound.
+    pub fn resolve_composition(env: Env, sbt_id: u64) -> Vec<u64> {
+        let mut visited = Map::new(&env);
+        let mut resolved = Vec::new(&env);
+        Self::resolve_composition_inner(&env, sbt_id, 0, &mut visited, &mut resolved);
+        resolved
+    }
+
     /// Sets metadata shared across the SBT and any NFT it is composed with.
     /// Owner only.
     pub fn set_shared_metadata(env: Env, sbt_id: u64, metadata: String) {
@@ -768,6 +838,141 @@ impl SbtContract {
         Self::load_delegation_history(&env, sbt_id)
     }
 
+    // ---- #51: recovery code system ----
+    //
+    // Recovery codes let a lost SBT be reclaimed without the original
+    // owner's signature (the whole point of a recovery flow is that the
+    // owner can no longer sign). Only `sha256(code)` is ever stored; the
+    // plaintext codes are returned once, at generation time, and the caller
+    // is responsible for storing them off-chain. Regenerating replaces (and
+    // so invalidates) any previously issued, unused codes.
+    //
+    // `recover_sbt_with_recovery_code` takes an explicit `new_holder`
+    // address rather than relying on an implicit caller identity: Soroban
+    // has no `msg.sender` equivalent, so the address regaining control must
+    // be passed and authorized explicitly.
+    //
+    // Security note: recovery codes are generated with `env.prng()`, which
+    // the Soroban SDK documents as unsuitable for secrets in applications
+    // with low risk tolerance. This is acceptable for the scope of this
+    // feature but should be revisited (e.g. moving to an off-chain-generated,
+    // on-chain-committed scheme) before using this contract to guard
+    // high-value identities.
+
+    /// Generates `RECOVERY_CODE_COUNT` fresh one-time recovery codes for
+    /// `sbt_id`, returning the plaintext codes. Only their SHA-256 hashes
+    /// are persisted. Owner only.
+    pub fn generate_sbt_recovery_codes(env: Env, sbt_id: u64) -> Vec<BytesN<32>> {
+        Self::require_owner(&env, sbt_id);
+
+        let prng = env.prng();
+        let mut plaintext_codes: Vec<BytesN<32>> = Vec::new(&env);
+        let mut hashed_codes: Vec<BytesN<32>> = Vec::new(&env);
+
+        for _ in 0..RECOVERY_CODE_COUNT {
+            let raw: [u8; 32] = prng.gen();
+            let code = BytesN::from_array(&env, &raw);
+            let code_bytes: Bytes = code.clone().into();
+            let hash: BytesN<32> = env.crypto().sha256(&code_bytes).into();
+            plaintext_codes.push_back(code);
+            hashed_codes.push_back(hash);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RecoveryCodes(sbt_id), &hashed_codes);
+
+        env.events().publish(
+            (RECOVERY_CODES_GENERATED_TOPIC, sbt_id),
+            hashed_codes.len(),
+        );
+        plaintext_codes
+    }
+
+    /// Reclaims `sbt_id` for `new_holder` by redeeming a still-unused
+    /// recovery code. `new_holder` must authorize the call. Rate limited to
+    /// `RECOVERY_MAX_ATTEMPTS` attempts per `RECOVERY_ATTEMPT_WINDOW_SECONDS`
+    /// per SBT, counting both successful and failed attempts. Returns
+    /// `true` and reassigns the holder on success; `false` if the code does
+    /// not match any unused, stored hash.
+    pub fn recover_sbt_with_recovery_code(
+        env: Env,
+        sbt_id: u64,
+        recovery_code: Bytes,
+        new_holder: Address,
+    ) -> bool {
+        new_holder.require_auth();
+        // Panics with TokenNotFound if the SBT does not exist, before any
+        // attempt budget is consumed.
+        Self::load_owner(&env, sbt_id);
+
+        // A fractionally-owned SBT has no single holder to reassign.
+        if Self::is_fractional(&env, sbt_id) {
+            panic_with_error!(&env, SbtError::FractionalOwnershipExists);
+        }
+
+        Self::enforce_recovery_rate_limit(&env, sbt_id);
+
+        let codes_key = DataKey::RecoveryCodes(sbt_id);
+        let mut hashed_codes: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&codes_key)
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NoRecoveryCodes));
+
+        let submitted_hash: BytesN<32> = env.crypto().sha256(&recovery_code).into();
+        let Some(index) = hashed_codes.first_index_of(submitted_hash) else {
+            return false;
+        };
+
+        hashed_codes.remove(index);
+        env.storage().instance().set(&codes_key, &hashed_codes);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Owner(sbt_id), &new_holder);
+        // A delegation granted by the previous holder must not carry over to
+        // the new holder, mirroring `batch_transfer_sbt_conditional`.
+        env.storage().instance().remove(&DataKey::Delegation(sbt_id));
+
+        env.events()
+            .publish((RECOVERY_SUCCEEDED_TOPIC, sbt_id), new_holder);
+        true
+    }
+
+    /// Enforces the per-SBT recovery attempt rate limit. Every call to
+    /// `recover_sbt_with_recovery_code` — successful or failed — counts
+    /// against `RECOVERY_MAX_ATTEMPTS` attempts per
+    /// `RECOVERY_ATTEMPT_WINDOW_SECONDS`, so brute-forcing a recovery code
+    /// is bounded. Panics with `RecoveryRateLimited` once the budget is
+    /// exhausted; the window restarts on the first attempt after it elapses.
+    fn enforce_recovery_rate_limit(env: &Env, sbt_id: u64) {
+        let now = env.ledger().timestamp();
+        let key = DataKey::RecoveryAttempts(sbt_id);
+        let mut state = env
+            .storage()
+            .instance()
+            .get::<DataKey, RecoveryAttemptState>(&key)
+            .unwrap_or(RecoveryAttemptState {
+                attempt_count: 0,
+                window_start: now,
+            });
+
+        if now.saturating_sub(state.window_start) >= RECOVERY_ATTEMPT_WINDOW_SECONDS {
+            state.window_start = now;
+            state.attempt_count = 0;
+        }
+
+        if state.attempt_count >= RECOVERY_MAX_ATTEMPTS {
+            env.events()
+                .publish((RECOVERY_RATE_LIMITED_TOPIC, sbt_id), state.attempt_count);
+            panic_with_error!(env, SbtError::RecoveryRateLimited);
+        }
+
+        state.attempt_count += 1;
+        env.storage().instance().set(&key, &state);
+    }
+
     // ---- helpers ----
 
     fn require_admin(env: &Env) {
@@ -799,6 +1004,58 @@ impl SbtContract {
         let mut buffer = [0u8; MAX_METADATA_SIZE as usize];
         metadata.copy_into_slice(&mut buffer[..length]);
         String::from_bytes(env, &buffer[..length])
+    }
+
+    fn composition_reaches_any(env: &Env, roots: &Vec<u64>, target: u64) -> bool {
+        let mut visited = Map::new(env);
+        let mut pending = Vec::new(env);
+        for root in roots.iter() {
+            pending.push_back(*root);
+        }
+        let mut steps = 0u32;
+        while let Some(current) = pending.pop_back() {
+            if current == target {
+                return true;
+            }
+            if visited.contains_key(current) {
+                continue;
+            }
+            visited.set(current, true);
+            steps += 1;
+            if steps > MAX_COMPOSITION_DEPTH {
+                return true;
+            }
+            if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+                &DataKey::CompositionComponents(current),
+            ) {
+                for component in components.component_ids.iter() {
+                    pending.push_back(*component);
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_composition_inner(
+        env: &Env,
+        current: u64,
+        depth: u32,
+        visited: &mut Map<u64, bool>,
+        resolved: &mut Vec<u64>,
+    ) {
+        if depth >= MAX_COMPOSITION_DEPTH || visited.contains_key(current) {
+            panic_with_error!(env, SbtError::InvalidCompositionGraph);
+        }
+        visited.set(current, true);
+        if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+            &DataKey::CompositionComponents(current),
+        ) {
+            for component in components.component_ids.iter() {
+                Self::load_owner(env, *component);
+                resolved.push_back(*component);
+                Self::resolve_composition_inner(env, *component, depth + 1, visited, resolved);
+            }
+        }
     }
 
     fn load_owner(env: &Env, sbt_id: u64) -> Address {

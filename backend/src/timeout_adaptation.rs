@@ -319,6 +319,122 @@ mod tests {
         assert_eq!(endpoints, vec!["a".to_string(), "b".to_string()]);
     }
 
+    /// Simulation test: feed a long run of steady-state (constant) latency
+    /// samples and confirm the adapted timeout converges to the observed
+    /// latency within a bounded number of iterations (`min_samples`), then
+    /// never changes again — i.e. it settles rather than oscillating.
+    #[test]
+    fn current_timeout_converges_within_min_samples_under_steady_state_load() {
+        let config = TimeoutAdaptationConfig {
+            min_samples: 10,
+            window_size: 30,
+            multiplier: 1.0,
+            ..TimeoutAdaptationConfig::default()
+        };
+        let manager = AdaptiveTimeoutManager::new(config);
+        let steady_latency = Duration::from_millis(80);
+
+        for i in 1..=config.min_samples {
+            manager.record_latency("steady", steady_latency);
+            if i < config.min_samples {
+                assert_eq!(
+                    manager.current_timeout("steady"),
+                    config.default_timeout,
+                    "should still use the default timeout before min_samples is reached"
+                );
+            }
+        }
+
+        // Convergence: exactly at min_samples, the adapted timeout should
+        // match the steady-state latency (multiplier 1.0, no clamping in
+        // range) and then hold steady indefinitely under continued
+        // steady-state load rather than drifting or oscillating.
+        let converged = manager.current_timeout("steady");
+        assert_eq!(converged, steady_latency);
+
+        for _ in 0..100 {
+            manager.record_latency("steady", steady_latency);
+            assert_eq!(
+                manager.current_timeout("steady"),
+                converged,
+                "adapted timeout oscillated under constant steady-state load"
+            );
+        }
+    }
+
+    /// The predictive EMA (`predict_timeout`) should also settle to the
+    /// steady-state value (within a small tolerance for floating-point
+    /// accumulation) once enough steady-state samples have fed its history.
+    #[test]
+    fn predicted_timeout_converges_toward_steady_state_value() {
+        let config = TimeoutAdaptationConfig {
+            min_samples: 5,
+            window_size: 10,
+            multiplier: 1.0,
+            ..TimeoutAdaptationConfig::default()
+        };
+        let manager = AdaptiveTimeoutManager::new(config);
+        let steady_latency = Duration::from_millis(120);
+
+        // Well past HISTORY_CAPACITY (20) pushes so the EMA has settled.
+        for _ in 0..60 {
+            manager.record_latency("steady", steady_latency);
+        }
+
+        let predicted = manager
+            .predict_timeout("steady")
+            .expect("expected a prediction after enough steady-state samples");
+        let delta_ms = (predicted.as_millis() as i128 - steady_latency.as_millis() as i128).abs();
+        assert!(
+            delta_ms <= 2,
+            "predicted timeout {predicted:?} should have converged near the steady-state \
+             latency {steady_latency:?}, delta {delta_ms}ms"
+        );
+    }
+
+    /// Latency spike followed by recovery: a single large spike should
+    /// widen the adapted timeout immediately, and the timeout should return
+    /// to its pre-spike baseline once the spike ages out of the fixed-size
+    /// rolling window (after `window_size` further steady-state samples).
+    #[test]
+    fn timeout_widens_on_spike_then_recovers_once_it_ages_out_of_window() {
+        let config = TimeoutAdaptationConfig {
+            min_samples: 5,
+            window_size: 20,
+            multiplier: 1.0,
+            percentile: 0.99,
+            ..TimeoutAdaptationConfig::default()
+        };
+        let manager = AdaptiveTimeoutManager::new(config);
+        let baseline = Duration::from_millis(60);
+        let spike = Duration::from_secs(5);
+
+        for _ in 0..config.window_size {
+            manager.record_latency("recovering", baseline);
+        }
+        let baseline_timeout = manager.current_timeout("recovering");
+        assert_eq!(baseline_timeout, baseline);
+
+        manager.record_latency("recovering", spike);
+        let spiked_timeout = manager.current_timeout("recovering");
+        assert!(
+            spiked_timeout > baseline_timeout,
+            "timeout should widen in response to a latency spike"
+        );
+
+        // Push enough baseline samples for the single spike sample to fully
+        // age out of the fixed-size rolling window (FIFO eviction means it
+        // is guaranteed gone after `window_size` more pushes).
+        for _ in 0..config.window_size {
+            manager.record_latency("recovering", baseline);
+        }
+        let recovered_timeout = manager.current_timeout("recovering");
+        assert_eq!(
+            recovered_timeout, baseline,
+            "timeout should recover to the pre-spike baseline once the spike ages out of the window"
+        );
+    }
+
     /// Micro-benchmark-style scenario (no external harness): simulate a
     /// burst of latency samples and confirm adaptation stays within a
     /// reasonable wall-clock budget. Documented further in

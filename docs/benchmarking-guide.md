@@ -222,6 +222,46 @@ diff before.txt after.txt
 - Use statistical analysis in HTML report to identify true regressions
 - Focus on relative changes, not absolute values
 
+## Baseline Regression Detection (CI)
+
+`contracts/ttl_vault/benches/baseline.json` tracks the last known-good CPU/memory
+costs for each `bench_trigger_release_*` case in
+`trigger_release_bench_tests.rs`. The CI workflow (`.github/workflows/ci.yml`)
+runs `scripts/compare_bench_baseline.py` immediately after `cargo test
+--package ttl-vault`, which:
+
+1. Runs `cargo test --package ttl-vault bench_trigger_release -- --nocapture`.
+2. Parses each `trigger_release(n=N) → cpu=... mem=...` line.
+3. Compares measured `cpu` against `baseline.json`, using the
+   `tolerance_percent` field (currently 15%).
+4. Fails the build (non-zero exit) if any benchmark's CPU cost regresses
+   beyond tolerance; prints a comparison table either way.
+
+To run this check locally:
+
+```bash
+python3 scripts/compare_bench_baseline.py
+```
+
+To get a warning without failing the build (e.g. while investigating a known,
+accepted regression), pass `--warn-only`.
+
+### Updating the Baseline
+
+When a change intentionally shifts performance (new feature, deliberate
+optimization, or an accepted regression with a documented reason), update the
+baseline in the same PR as the code change:
+
+```bash
+python3 scripts/compare_bench_baseline.py --update-baseline
+git diff contracts/ttl_vault/benches/baseline.json
+git add contracts/ttl_vault/benches/baseline.json
+```
+
+Include in the PR description *why* the numbers moved. Do not update the
+baseline just to silence a CI failure without explaining the cause — an
+unexplained regression should be treated as a bug first.
+
 ## References
 
 - [Criterion.rs Documentation](https://bheisler.github.io/criterion.rs/book/)
