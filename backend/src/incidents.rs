@@ -155,20 +155,29 @@ fn timeline_entry(actor: impl Into<String>, note: impl Into<String>) -> Timeline
     }
 }
 
-/// `POST /incidents` — open a new incident with severity classification.
-pub async fn create_incident(
-    State(state): State<Arc<IncidentState>>,
-    Json(body): Json<CreateIncidentRequest>,
-) -> (StatusCode, Json<Incident>) {
+/// Open a new incident directly against `store`, bypassing the HTTP layer.
+///
+/// This is the synchronous entry point used by background jobs (e.g. the
+/// scheduled consensus reconciliation and backup checksum verification
+/// jobs) that detect a problem outside of a request/response cycle and need
+/// to surface it to operators the same way a manually-filed incident would
+/// be tracked. `create_incident` (the `POST /incidents` handler) builds on
+/// top of this so both paths produce identical `Incident` records.
+pub fn open_incident(
+    store: &IncidentStore,
+    title: impl Into<String>,
+    description: impl Into<String>,
+    severity: IncidentSeverity,
+) -> Incident {
     let now = Utc::now();
     let incident = Incident {
         id: Uuid::new_v4().to_string(),
-        title: body.title,
-        description: body.description,
-        severity: body.severity,
+        title: title.into(),
+        description: description.into(),
+        severity,
         status: IncidentStatus::Open,
         escalation_level: 0,
-        assigned_to: body.assigned_to,
+        assigned_to: None,
         timeline: vec![timeline_entry("system", "incident opened")],
         created_at: now,
         updated_at: now,
@@ -177,11 +186,30 @@ pub async fn create_incident(
     tracing::warn!(
         incident_id = %incident.id,
         severity = ?incident.severity,
+        title = %incident.title,
         "incident opened"
     );
 
-    let mut store = state.store.lock().unwrap();
-    store.insert(incident.id.clone(), incident.clone());
+    store
+        .lock()
+        .unwrap()
+        .insert(incident.id.clone(), incident.clone());
+
+    incident
+}
+
+/// `POST /incidents` — open a new incident with severity classification.
+pub async fn create_incident(
+    State(state): State<Arc<IncidentState>>,
+    Json(body): Json<CreateIncidentRequest>,
+) -> (StatusCode, Json<Incident>) {
+    let mut incident = open_incident(&state.store, body.title, body.description, body.severity);
+    incident.assigned_to = body.assigned_to.clone();
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert(incident.id.clone(), incident.clone());
 
     (StatusCode::CREATED, Json(incident))
 }
@@ -267,4 +295,30 @@ pub fn is_past_escalation_sla(incident: &Incident) -> bool {
     }
     let elapsed = Utc::now() - incident.created_at;
     elapsed.num_minutes() > incident.severity.escalation_sla_minutes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_incident_inserts_into_store_as_open() {
+        let store = create_incident_store();
+        let incident = open_incident(&store, "cache drift detected", "3 conflicting keys", IncidentSeverity::Sev2);
+
+        assert_eq!(incident.status, IncidentStatus::Open);
+        assert_eq!(incident.escalation_level, 0);
+        assert_eq!(incident.timeline.len(), 1);
+
+        let stored = store.lock().unwrap().get(&incident.id).cloned();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().title, "cache drift detected");
+    }
+
+    #[test]
+    fn fresh_incident_is_not_past_sla() {
+        let store = create_incident_store();
+        let incident = open_incident(&store, "t", "d", IncidentSeverity::Sev1);
+        assert!(!is_past_escalation_sla(&incident));
+    }
 }

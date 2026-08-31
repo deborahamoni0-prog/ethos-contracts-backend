@@ -24,6 +24,9 @@
 /// - Voting is open until `voting_deadline`.
 /// - After deadline, a proposal is automatically approved if ≥ 50% of attestors
 ///   approve it; otherwise rejected.
+/// - Finalization requires at least the configured `min_quorum` votes to have
+///   been cast; otherwise resolution is rejected with `InsufficientQuorum` and
+///   the proposal stays Pending so more attestors can vote.
 /// - Once approved, the executor calls `execute_slice_modification` to apply changes.
 ///
 /// # Modification history
@@ -40,6 +43,12 @@ pub const DEFAULT_VOTING_PERIOD: u64 = 604_800;
 
 /// Minimum number of attestors required for voting to proceed (prevents edge case with 0 attestors).
 pub const MIN_ATTESTORS_REQUIRED: u32 = 1;
+
+/// Default minimum number of votes (approvals + rejections) required before a
+/// proposal can be finalized. A quorum of 1 preserves legacy behavior;
+/// operators can raise it via `set_voting_config` so that a small number of
+/// attestors cannot make binding decisions.
+pub const DEFAULT_MIN_QUORUM: u32 = 1;
 
 // ── Event topics ─────────────────────────────────────────────────────────────
 
@@ -63,9 +72,21 @@ pub enum VotingKey {
     ModificationHistory(u64),
     /// List of registered attestors (cached for voting eligibility).
     AttestorRegistry,
+    /// Voting configuration (e.g. minimum quorum required for finalization).
+    VotingConfig,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+/// Voting configuration for slice consensus.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VotingConfig {
+    /// Minimum number of votes (approvals + rejections) that must be cast
+    /// before a proposal can be finalized. Prevents a small number of
+    /// attestors from making binding decisions.
+    pub min_quorum: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +210,27 @@ pub fn get_attestor_registry(env: &Env) -> Vec<Address> {
         .persistent()
         .get(&key)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Set the voting configuration (e.g. the minimum quorum for finalization).
+pub fn set_voting_config(env: &Env, min_quorum: u32) {
+    let config = VotingConfig { min_quorum };
+    let key = VotingKey::VotingConfig;
+    env.storage().persistent().set(&key, &config);
+    env.storage().persistent().extend_ttl(
+        &key,
+        crate::VAULT_TTL_THRESHOLD,
+        crate::VAULT_TTL_LEDGERS,
+    );
+}
+
+/// Get the current voting configuration, falling back to `DEFAULT_MIN_QUORUM`
+/// when no explicit configuration has been stored.
+pub fn get_voting_config(env: &Env) -> VotingConfig {
+    let key = VotingKey::VotingConfig;
+    env.storage().persistent().get(&key).unwrap_or(VotingConfig {
+        min_quorum: DEFAULT_MIN_QUORUM,
+    })
 }
 
 /// Check if an address is a registered attestor.
@@ -380,22 +422,37 @@ pub fn vote_on_modification(
 
 /// Finalize a proposal's voting (called after voting deadline expires or voting is complete).
 ///
-/// Returns `true` if the proposal was resolved, `false` if already resolved.
+/// Returns `Ok(true)` if the proposal was resolved, `Ok(false)` if the proposal
+/// does not exist or was already resolved (idempotent).
 /// Sets status to Approved if ≥ 50% of attestors voted in favor, otherwise Rejected.
-pub fn resolve_modification_voting(env: &Env, slice_id: u64, proposal_id: u64) -> bool {
+/// Returns `Err(ContractError::InsufficientQuorum)` if fewer than the configured
+/// quorum of votes have been cast; the proposal stays Pending so voting can continue.
+pub fn resolve_modification_voting(
+    env: &Env,
+    slice_id: u64,
+    proposal_id: u64,
+) -> Result<bool, crate::ContractError> {
     let proposal_key = VotingKey::ModificationProposal(slice_id, proposal_id);
     let mut proposal: ModificationProposal = match env.storage().persistent().get(&proposal_key) {
         Some(p) => p,
-        None => return false,
+        None => return Ok(false),
     };
 
     // If already resolved, return false (idempotent).
     if proposal.status != ProposalStatus::Pending {
-        return false;
+        return Ok(false);
+    }
+
+    // Enforce the minimum quorum: a small number of voters must not be able to
+    // make binding decisions, so finalization is rejected until enough
+    // attestors have cast a vote.
+    let total_voted = proposal.approve_count.saturating_add(proposal.reject_count);
+    let min_quorum = get_voting_config(env).min_quorum;
+    if total_voted < min_quorum {
+        return Err(crate::ContractError::InsufficientQuorum);
     }
 
     // Determine if proposal is approved (≥ 50% approval).
-    let _total_voted = proposal.approve_count.saturating_add(proposal.reject_count);
     let is_approved = if proposal.total_attestors > 0 {
         (proposal.approve_count as u64 * 100) >= (proposal.total_attestors as u64 * 50)
     } else {
@@ -426,7 +483,7 @@ pub fn resolve_modification_voting(env: &Env, slice_id: u64, proposal_id: u64) -
         },
     );
 
-    true
+    Ok(true)
 }
 
 /// Execute an approved modification (owner calls this after voting is approved).

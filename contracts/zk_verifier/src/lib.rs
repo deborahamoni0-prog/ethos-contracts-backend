@@ -6,7 +6,7 @@ use consistency::CredentialRegistry;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
-    xdr::FromXdr, Address, Bytes, BytesN, Env, Vec,
+    xdr::FromXdr, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
@@ -36,12 +36,20 @@ pub const MAX_CREDENTIAL_SNAPSHOTS: u32 = 1000;
 /// validating a parent's ancestry, so that chain walks (and the gas they
 /// cost) stay bounded. See docs/zk-verifier.md, "Credential Hierarchies".
 pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
+/// Number of ledger seconds between scheduled consistency re-checks for a
+/// long-lived attestation. `attest` and `create_derived_credential` schedule
+/// the first check this far after attestation; each completed re-check (via
+/// [`ZkVerifierContract::reschedule_consistency_check`]) pushes the next one
+/// out by the same window. See docs/zk-verifier.md, "Scheduled Consistency
+/// Re-Checks".
+pub const CONSISTENCY_CHECK_INTERVAL: u64 = 30 * 24 * 60 * 60;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
 const VERIFY_LATTICE_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_latt");
 const AUDIT_LOG_TOPIC: soroban_sdk::Symbol = symbol_short!("audit_log");
 const PROOF_MASKED_TOPIC: soroban_sdk::Symbol = symbol_short!("proof_msk");
+const CONSISTENCY_DUE_TOPIC: soroban_sdk::Symbol = symbol_short!("cons_due");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -93,6 +101,9 @@ pub enum VerifierError {
     /// A masked proof was not attested by a currently-registered oracle for
     /// the given claim.
     MaskedVerificationFailed = 20,
+    /// The caller is not permitted to view this credential's attestation
+    /// record at its current privacy level.
+    AccessDenied = 21,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -178,6 +189,12 @@ mod keys {
         /// proof_sha256 (of the original, unmasked proof) -> MaskingConfig,
         /// recorded by `ZkVerifierContract::mask_proof_fields`.
         MaskingConfig(BytesN<32>),
+        /// credential_id -> MaskingConfig, recorded the first time
+        /// `ZkVerifierContract::get_attestation` serves a redacted
+        /// `AttestationRecord` for that credential (i.e. an unauthorized
+        /// caller at `PrivacyLevel::Confidential`). Mirrors the proof-field
+        /// masking audit trail in `DataKey::MaskingConfig`.
+        AttestationMasking(u64),
         /// proof_sha256 -> ledger timestamp of the most recent
         /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
         LastVerificationTime(BytesN<32>),
@@ -214,6 +231,13 @@ use keys::{DataKey, MaskingConfig, VerificationRecord};
 pub struct AttestationRecord {
     pub credential_id: u64,
     pub oracle: Address,
+    /// Ledger timestamp at which the attestation's next scheduled
+    /// consistency re-check becomes due. Set to `attestation time +
+    /// CONSISTENCY_CHECK_INTERVAL` at attestation (and re-attestation), and
+    /// advanced by `reschedule_consistency_check` after each completed
+    /// re-check. See `is_consistency_check_due` and
+    /// docs/zk-verifier.md, "Scheduled Consistency Re-Checks".
+    pub next_check_due: u64,
 }
 
 /// A point-in-time snapshot of a credential's attestation state, captured
@@ -258,10 +282,11 @@ pub struct CredentialVersionDiff {
     pub current_invalidated: bool,
 }
 
-/// Controls who may read a credential's attestation state via
-/// [`ZkVerifierContract::get_credential_at_time`]. Set per-credential by the
-/// admin via [`ZkVerifierContract::set_credential_privacy`]; defaults to
-/// `Public` for every credential until explicitly changed.
+/// Controls who may read a credential's attestation record/state via
+/// [`ZkVerifierContract::get_attestation`] (and, once restored,
+/// `get_credential_at_time`). Set per-credential by the admin via
+/// [`ZkVerifierContract::set_credential_privacy`]; defaults to `Public` for
+/// every credential until explicitly changed.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrivacyLevel {
@@ -364,6 +389,10 @@ impl ZkVerifierContract {
             &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
+                next_check_due: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(CONSISTENCY_CHECK_INTERVAL),
             },
         );
 
@@ -447,6 +476,10 @@ impl ZkVerifierContract {
             &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
+                next_check_due: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(CONSISTENCY_CHECK_INTERVAL),
             },
         );
 
@@ -758,6 +791,53 @@ impl ZkVerifierContract {
             .unwrap_or(PrivacyLevel::Public)
     }
 
+    /// Returns the current [`AttestationRecord`] for `credential_id` (the
+    /// oracle currently standing behind it, and its stable credential id),
+    /// or `None` if that id was never attested.
+    ///
+    /// `requester` must authorize the call (so the caller cannot be
+    /// spoofed) and is checked against the credential's current
+    /// [`PrivacyLevel`]:
+    ///
+    /// - **`Public`** — anyone may read the full record.
+    /// - **`Internal`** — the admin or a currently-registered oracle may
+    ///   read the full record; anyone else is denied with `AccessDenied`.
+    /// - **`Confidential`** — the admin may read the full record; anyone
+    ///   else receives a *redacted* copy whose sensitive fields (`oracle`)
+    ///   are masked out (see [`Self::redact_attestation_record`]), and the
+    ///   redaction is recorded on-chain in a [`MaskingConfig`] under
+    ///   `DataKey::AttestationMasking`. The record's existence and
+    ///   `credential_id` remain visible, but the attesting oracle is not
+    ///   disclosed.
+    pub fn get_attestation(
+        env: Env,
+        requester: Address,
+        credential_id: u64,
+    ) -> Option<AttestationRecord> {
+        requester.require_auth();
+
+        let record = Self::load_attestation_record(&env, credential_id)?;
+
+        match Self::credential_privacy(env.clone(), credential_id) {
+            PrivacyLevel::Public => Some(record),
+            PrivacyLevel::Internal => {
+                if Self::is_admin(&env, &requester) || Self::is_registered_oracle(&env, &requester)
+                {
+                    Some(record)
+                } else {
+                    panic_with_error!(&env, VerifierError::AccessDenied);
+                }
+            }
+            PrivacyLevel::Confidential => {
+                if Self::is_admin(&env, &requester) {
+                    Some(record)
+                } else {
+                    Some(Self::redact_attestation_record(&env, &record))
+                }
+            }
+        }
+    }
+
     // ---- helpers ----
 
     /// Structural format check for `verify_lattice_proof`'s input: `proof`
@@ -826,14 +906,77 @@ impl ZkVerifierContract {
 
     /// Panics with `OracleNotFound` unless `oracle` is currently registered.
     fn require_registered_oracle(env: &Env, oracle: &Address) {
-        let is_registered = env
-            .storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
-            .unwrap_or(false);
-        if !is_registered {
+        if !Self::is_registered_oracle(env, oracle) {
             panic_with_error!(env, VerifierError::OracleNotFound);
         }
+    }
+
+    /// Returns whether `oracle` is a currently-registered oracle.
+    fn is_registered_oracle(env: &Env, oracle: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Returns whether `address` is the contract's admin.
+    fn is_admin(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .is_some_and(|admin| &admin == address)
+    }
+
+    /// Looks up the current `AttestationRecord` for `credential_id` by
+    /// following `CredentialHashes(credential_id)` to the underlying
+    /// `Attestation(proof_hash, claim_hash)` entry. Returns `None` if the
+    /// credential id is unknown.
+    fn load_attestation_record(env: &Env, credential_id: u64) -> Option<AttestationRecord> {
+        let (proof_hash, claim_hash): (BytesN<32>, BytesN<32>) = env
+            .storage()
+            .instance()
+            .get(&DataKey::CredentialHashes(credential_id))?;
+        env.storage()
+            .instance()
+            .get(&DataKey::Attestation(proof_hash, claim_hash))
+    }
+
+    /// Returns a copy of `record` with its sensitive fields masked out, for
+    /// callers that may learn a credential exists but may not see who stands
+    /// behind it (unauthorized callers at `PrivacyLevel::Confidential`).
+    ///
+    /// The redaction is recorded on-chain so it is auditable: a
+    /// [`MaskingConfig`] — the same type `mask_proof_fields` uses for
+    /// proof-field masking — is stored under `DataKey::AttestationMasking`
+    /// keyed by the credential, with the masked-field bitmask set for
+    /// [`ATTESTATION_RECORD_FIELD_ORACLE`]. `credential_id` is never
+    /// masked, so the redacted record still identifies itself.
+    fn redact_attestation_record(env: &Env, record: &AttestationRecord) -> AttestationRecord {
+        let field_mask = 1u32 << ATTESTATION_RECORD_FIELD_ORACLE;
+        env.storage().instance().set(
+            &DataKey::AttestationMasking(record.credential_id),
+            &MaskingConfig {
+                masked_fields: env
+                    .crypto()
+                    .sha256(&Bytes::from_array(env, &field_mask.to_le_bytes()))
+                    .into(),
+                version: 1,
+            },
+        );
+        AttestationRecord {
+            credential_id: record.credential_id,
+            oracle: Self::masked_oracle(env),
+        }
+    }
+
+    /// Returns the well-defined "masked" `Address` used in place of a
+    /// redacted attestation record's `oracle`: the all-zero Ed25519 account
+    /// ([`MASKED_ORACLE_STRKEY`]). An all-zero key is not a usable Stellar
+    /// account, so a masked oracle can never be mistaken for a genuine
+    /// attesting oracle, but it is a valid `Address` value that round-trips
+    /// through storage and events.
+    fn masked_oracle(env: &Env) -> Address {
+        Address::from_string(&String::from_str(env, MASKED_ORACLE_STRKEY))
     }
 
     /// Returns the existing credential_id for `(proof_hash, claim_hash)` if
@@ -1070,6 +1213,84 @@ impl ZkVerifierContract {
             Ok(()) => true,
             Err(_) => false,
         }
+    }
+
+    /// Returns whether the credential's scheduled consistency re-check is
+    /// due: the current ledger timestamp is at or past the attestation's
+    /// `next_check_due` (set at attestation, advanced by
+    /// [`Self::reschedule_consistency_check`]). Mirrors
+    /// [`Self::is_credential_invalidated`]'s absence semantics — a
+    /// credential id that was never attested has no schedule and is never
+    /// due, so this returns `false` rather than panicking.
+    ///
+    /// When the check is due, this also publishes a `cons_due` event
+    /// carrying `(credential_id, next_check_due)` so off-chain workers can
+    /// pick the credential up for re-verification (e.g. via
+    /// [`Self::verify_credentials_consistent`]) — the same "return a bool
+    /// and emit an event" shape as `verify_claim`'s `vfy_claim` event.
+    /// Publishing an event requires an actual transaction, so workers must
+    /// *invoke* this (not view-call it) for the event to be recorded; the
+    /// boolean result is available either way.
+    ///
+    /// A due check stays due until [`Self::reschedule_consistency_check`]
+    /// advances the window, so a worker that misses one poll can still act
+    /// on the next.
+    pub fn is_consistency_check_due(env: Env, credential_id: u64) -> bool {
+        let Some((proof_hash, claim_hash)) = env
+            .storage()
+            .instance()
+            .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
+        else {
+            return false;
+        };
+        let Some(record) = env.storage().instance().get::<DataKey, AttestationRecord>(
+            &DataKey::Attestation(proof_hash, claim_hash),
+        ) else {
+            return false;
+        };
+
+        let due = env.ledger().timestamp() >= record.next_check_due;
+        if due {
+            env.events().publish(
+                (CONSISTENCY_DUE_TOPIC,),
+                (credential_id, record.next_check_due),
+            );
+        }
+        due
+    }
+
+    /// Advances a credential's consistency-check schedule by one full
+    /// [`CONSISTENCY_CHECK_INTERVAL`] from the current ledger timestamp.
+    ///
+    /// Off-chain workers call this after performing the re-verification the
+    /// `cons_due` event signalled, which is what makes the check *periodic*
+    /// rather than due-once-and-forever. It has no privileged inputs — it
+    /// only moves a timer forward — so anyone may call it. Panics with
+    /// `CredentialNotFound` if `credential_id` was never attested.
+    pub fn reschedule_consistency_check(env: Env, credential_id: u64) {
+        let Some((proof_hash, claim_hash)) = env
+            .storage()
+            .instance()
+            .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
+        else {
+            panic_with_error!(&env, VerifierError::CredentialNotFound);
+        };
+
+        let mut record = env
+            .storage()
+            .instance()
+            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
+                proof_hash.clone(),
+                claim_hash.clone(),
+            ))
+            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::CredentialNotFound));
+        record.next_check_due = env
+            .ledger()
+            .timestamp()
+            .saturating_add(CONSISTENCY_CHECK_INTERVAL);
+        env.storage()
+            .instance()
+            .set(&DataKey::Attestation(proof_hash, claim_hash), &record);
     }
 }
 

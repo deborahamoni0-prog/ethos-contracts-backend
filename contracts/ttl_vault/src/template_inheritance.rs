@@ -117,6 +117,12 @@ pub fn create_template(
 
     // Check for cycle if inheriting
     if parent_template_id > 0 {
+        // The parent must exist — a dangling reference produces a broken chain
+        // that cycle detection cannot reason about.
+        if get_template(env, parent_template_id).is_none() {
+            soroban_sdk::panic_with_error!(env, crate::ContractError::TemplateNotFound);
+        }
+
         let result = check_inheritance_cycle(env, parent_template_id, template_id);
         if result.has_cycle {
             soroban_sdk::panic_with_error!(env, crate::ContractError::InheritanceCycleDetected);
@@ -251,6 +257,16 @@ pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> Cycl
             };
         }
 
+        // If the stored inheritance graph is already cyclic (e.g. corrupted
+        // state), detect the revisit immediately instead of looping until the
+        // depth cap is hit.
+        if vec_contains(&visited, current) {
+            return CycleCheckResult {
+                has_cycle: true,
+                cycle_path: visited,
+            };
+        }
+
         visited.push_back(current);
         current = get_parent_template_id(env, current);
         depth = depth.saturating_add(1);
@@ -260,6 +276,19 @@ pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> Cycl
         has_cycle: false,
         cycle_path: Vec::new(env),
     }
+}
+
+/// Returns true if `value` is present in `vec`.
+///
+/// Inheritance chains are bounded by [`MAX_INHERITANCE_DEPTH`], so a linear
+/// scan is sufficient.
+fn vec_contains(vec: &Vec<u64>, value: u64) -> bool {
+    for i in 0..vec.len() {
+        if vec.get(i).unwrap() == value {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve a template's data by applying all parent overrides.
@@ -281,6 +310,8 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
 
     // Walk up the inheritance chain, collecting overrides
     let mut override_chain: Vec<Bytes> = Vec::new(env);
+    // Templates visited so far, used to detect cycles in the inheritance graph.
+    let mut seen: Vec<u64> = Vec::new(env);
 
     loop {
         let _current_template = get_template(env, current_id)?;
@@ -289,6 +320,13 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
         if !overrides.is_empty() {
             override_chain.push_back(overrides);
         }
+
+        // A template that appears twice on the ancestor path means the
+        // inheritance graph is cyclic; terminate instead of walking forever.
+        if vec_contains(&seen, current_id) {
+            return None;
+        }
+        seen.push_back(current_id);
 
         let parent_id = get_parent_template_id(env, current_id);
         if parent_id == 0 {
@@ -346,8 +384,16 @@ pub fn invalidate_template_cache(env: &Env, template_id: u64) {
 pub fn get_inheritance_depth(env: &Env, template_id: u64) -> u32 {
     let mut depth = 0u32;
     let mut current = template_id;
+    let mut seen: Vec<u64> = Vec::new(env);
 
     loop {
+        // Guard against cycles in the inheritance graph: stop as soon as a
+        // template is revisited instead of walking until MAX_INHERITANCE_DEPTH.
+        if vec_contains(&seen, current) {
+            break;
+        }
+        seen.push_back(current);
+
         let parent_id = get_parent_template_id(env, current);
         if parent_id == 0 {
             break;
@@ -653,6 +699,116 @@ mod tests {
 
             let id4 = create_template(&env, name.clone(), data.clone(), id3, overrides.clone());
             assert_eq!(get_inheritance_depth(&env, id4), 4);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #124)")]
+    fn test_create_template_rejects_nonexistent_parent() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Parent 42 was never created — must be rejected instead of
+            // producing a dangling parent reference.
+            create_template(&env, name, data, 42, overrides);
+        });
+    }
+
+    #[test]
+    fn test_resolve_template_detects_cycle() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::from_slice(&env, &[1, 2, 3]);
+            let overrides = Bytes::new(&env);
+
+            // Consume template id 0 (the root sentinel) first so the cyclic
+            // templates get non-zero ids; a cycle through id 0 could never be
+            // detected because 0 means "no parent".
+            create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let a = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let b = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Corrupt the graph directly: a -> b -> a
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(a), &b);
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(b), &a);
+
+            // Resolution must terminate (no infinite recursion) and report the
+            // cyclic chain as broken instead of walking until the depth cap.
+            assert!(resolve_template(&env, a).is_none());
+            assert!(resolve_template(&env, b).is_none());
+        });
+    }
+
+    #[test]
+    fn test_inheritance_depth_detects_cycle() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Consume template id 0 (the root sentinel) first so the cyclic
+            // templates get non-zero ids; a cycle through id 0 could never be
+            // detected because 0 means "no parent".
+            create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let a = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let b = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Corrupt the graph directly: a -> b -> a
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(a), &b);
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(b), &a);
+
+            // The depth walk must stop at the cycle instead of hitting
+            // MAX_INHERITANCE_DEPTH.
+            assert!(get_inheritance_depth(&env, a) < MAX_INHERITANCE_DEPTH);
+            assert!(get_inheritance_depth(&env, b) < MAX_INHERITANCE_DEPTH);
+        });
+    }
+
+    #[test]
+    fn test_check_cycle_detects_corrupted_graph() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Consume template id 0 (the root sentinel) first so the cyclic
+            // templates get non-zero ids; id 0 means "no parent", so a cycle
+            // through it would be indistinguishable from reaching the root.
+            create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let a = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let b = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Corrupt the graph directly: a -> b -> a
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(a), &b);
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(b), &a);
+
+            // The walk from `b` revisits `b` and must be flagged as a cycle
+            // immediately, not after looping until the depth cap.
+            let result = check_inheritance_cycle(&env, b, 999);
+            assert!(result.has_cycle);
+            assert!(result.cycle_path.len() < MAX_INHERITANCE_DEPTH);
         });
     }
 }

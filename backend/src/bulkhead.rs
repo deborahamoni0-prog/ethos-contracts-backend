@@ -162,6 +162,20 @@ impl BulkheadRegistry {
             )
         };
 
+        // Fast path: a concurrency slot is immediately available, so this
+        // request never actually has to wait — it must not be gated by
+        // `max_queue_size`, which bounds the *wait queue*, not total
+        // concurrency. Without this, `max_queue_size: 0` would reject every
+        // request outright even with free concurrent slots.
+        if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
+            metrics.active.fetch_add(1, Ordering::SeqCst);
+            return Ok(BulkheadPermit {
+                _permit: permit,
+                metrics,
+            });
+        }
+
+        // No slot free: this request must wait, gated by the queue budget.
         let queued_now = metrics.queued.fetch_add(1, Ordering::SeqCst) + 1;
         if queued_now > max_queue_size {
             metrics.queued.fetch_sub(1, Ordering::SeqCst);
@@ -184,7 +198,7 @@ impl BulkheadRegistry {
 
     pub fn metrics_snapshot(&self) -> Vec<BulkheadMetricsSnapshot> {
         let guard = self.bulkheads.lock().unwrap();
-        guard
+        let mut snapshots: Vec<_> = guard
             .iter()
             .map(|(endpoint, b)| BulkheadMetricsSnapshot {
                 endpoint: endpoint.clone(),
@@ -195,7 +209,102 @@ impl BulkheadRegistry {
                 rejected_total: b.metrics.rejected.load(Ordering::SeqCst),
                 completed_total: b.metrics.completed.load(Ordering::SeqCst),
             })
-            .collect()
+            .collect();
+        snapshots.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        snapshots
+    }
+
+    /// Render all bulkhead metrics in Prometheus text exposition format (#364).
+    ///
+    /// Exposes per-bulkhead labels for `active_permits`, `queue_depth`,
+    /// `rejected_total`, and `completed_total`.
+    pub fn render_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+        let snapshots = self.metrics_snapshot();
+        let mut out = String::new();
+        if snapshots.is_empty() {
+            return out;
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_active_permits Current active concurrency permits in use"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_active_permits gauge");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_active_permits{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.active
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_queue_depth Current number of queued requests waiting for a permit"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_queue_depth gauge");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_queue_depth{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.queued
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_rejected_total Total requests rejected due to full queue capacity"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_rejected_total counter");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_rejected_total{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.rejected_total
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_completed_total Total requests successfully completed through the bulkhead"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_completed_total counter");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_completed_total{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.completed_total
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_max_concurrent Configured maximum concurrent permits"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_max_concurrent gauge");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_max_concurrent{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.max_concurrent
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP bulkhead_max_queue_size Configured maximum queue size"
+        );
+        let _ = writeln!(out, "# TYPE bulkhead_max_queue_size gauge");
+        for s in &snapshots {
+            let _ = writeln!(
+                out,
+                "bulkhead_max_queue_size{{endpoint=\"{}\"}} {}",
+                s.endpoint, s.max_queue_size
+            );
+        }
+
+        out
     }
 }
 
@@ -273,5 +382,43 @@ mod tests {
         // A saturated /api/slow bulkhead must not affect /api/fast.
         let fast_permit = registry.acquire("/api/fast").await;
         assert!(fast_permit.is_ok());
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_render_with_per_bulkhead_labels() {
+        let registry = BulkheadRegistry::new(BulkheadConfig {
+            max_concurrent: 2,
+            max_queue_size: 0,
+        });
+
+        // Acquire permit on /api/vaults/42 -> endpoint /api/vaults
+        let permit = registry.acquire("/api/vaults/42").await.unwrap();
+        let out = registry.render_prometheus();
+        assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 1"));
+        assert!(out.contains("bulkhead_queue_depth{endpoint=\"/api/vaults\"} 0"));
+        assert!(out.contains("bulkhead_rejected_total{endpoint=\"/api/vaults\"} 0"));
+        assert!(out.contains("bulkhead_completed_total{endpoint=\"/api/vaults\"} 0"));
+        assert!(out.contains("bulkhead_max_concurrent{endpoint=\"/api/vaults\"} 2"));
+        assert!(out.contains("bulkhead_max_queue_size{endpoint=\"/api/vaults\"} 0"));
+
+        // Second permit
+        let permit2 = registry.acquire("/api/vaults/43").await.unwrap();
+        let out = registry.render_prometheus();
+        assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 2"));
+
+        // Third attempt exceeds capacity and max_queue_size=0 -> rejected!
+        let rej = registry.acquire("/api/vaults/44").await;
+        assert!(rej.is_err());
+
+        let out = registry.render_prometheus();
+        assert!(out.contains("bulkhead_rejected_total{endpoint=\"/api/vaults\"} 1"));
+
+        // Release permits -> completed_total increases, active decreases
+        drop(permit);
+        drop(permit2);
+
+        let out = registry.render_prometheus();
+        assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 0"));
+        assert!(out.contains("bulkhead_completed_total{endpoint=\"/api/vaults\"} 2"));
     }
 }

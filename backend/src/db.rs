@@ -86,6 +86,10 @@ pub struct AppState {
     pub query_cache: Arc<crate::query_cache::QueryCache>,
     /// Distributed-lock deadlock detector stats (#82).
     pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
+    /// Incident tracking: shared by the incident HTTP API and the scheduled
+    /// consensus reconciliation job (#373), so a conflict opens the same
+    /// kind of record a manually-filed incident would.
+    pub incident_state: Arc<crate::incidents::IncidentState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -121,6 +125,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationSta
 impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
     fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
         Arc::clone(&state.flag_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
+    fn from_ref(state: &AppState) -> Arc<crate::incidents::IncidentState> {
+        Arc::clone(&state.incident_state)
     }
 }
 
@@ -1162,6 +1172,126 @@ impl Db {
         Ok(())
     }
 
+    /// Roll back a single applied migration by its version, applying the
+    /// reverse SQL registered in `DOWN_MIGRATIONS` and removing the version
+    /// from `schema_migrations` so `migrate()` will re-apply it if called
+    /// again. See docs/migration-testing.md for the rollback-testing policy
+    /// this supports.
+    pub fn rollback(&self, version: &str) -> Result<(), rusqlite::Error> {
+        const DOWN_MIGRATIONS: &[(&str, &str)] = &[
+            (
+                "1",
+                r"
+                DROP TABLE IF EXISTS unsubscribed_users;
+                DROP TABLE IF EXISTS unsubscribe_tokens;
+                DROP TABLE IF EXISTS idempotency_keys;
+                DROP TABLE IF EXISTS owner_activity;
+                DROP TABLE IF EXISTS ttl_insurance_policies;
+                DROP TABLE IF EXISTS reminder_preferences;
+                ",
+            ),
+            ("2", "ALTER TABLE reminder_preferences DROP COLUMN deleted_at;"),
+            (
+                "3",
+                r"
+                DROP INDEX IF EXISTS idx_audit_logs_action;
+                DROP INDEX IF EXISTS idx_audit_logs_user_id;
+                DROP INDEX IF EXISTS idx_audit_logs_timestamp;
+                DROP TABLE IF EXISTS audit_logs;
+                ",
+            ),
+            ("4", "DROP TABLE IF EXISTS two_factor_config;"),
+            ("5", "DROP TABLE IF EXISTS vault_subscriptions;"),
+            (
+                "6",
+                r"
+                DROP INDEX IF EXISTS idx_tenant_vaults_vault_id;
+                DROP TABLE IF EXISTS tenant_vaults;
+                DROP TABLE IF EXISTS tenant_billing;
+                DROP TABLE IF EXISTS tenants;
+                ",
+            ),
+            (
+                "7",
+                r"
+                DROP INDEX IF EXISTS idx_collaborative_sessions_vault_id;
+                DROP INDEX IF EXISTS idx_credential_updates_vault_id;
+                DROP INDEX IF EXISTS idx_operational_transforms_vault_id;
+                DROP TABLE IF EXISTS collaborative_sessions;
+                DROP TABLE IF EXISTS user_presence;
+                DROP TABLE IF EXISTS conflict_resolutions;
+                DROP TABLE IF EXISTS operational_transforms;
+                DROP TABLE IF EXISTS credential_updates;
+                ",
+            ),
+            (
+                "8",
+                r"
+                DROP TABLE IF EXISTS vault_search_fts;
+                DROP TABLE IF EXISTS full_text_search_index;
+                DROP TABLE IF EXISTS search_facets;
+                ",
+            ),
+            ("9", "DROP TABLE IF EXISTS idempotency_keys_cleanup;"),
+            (
+                "10",
+                "ALTER TABLE reminder_preferences DROP COLUMN normalized_frequency;",
+            ),
+        ];
+
+        let down_sql = DOWN_MIGRATIONS
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, sql)| *sql)
+            .unwrap_or_else(|| panic!("no down migration registered for version {version}"));
+
+        tracing::info!(version = version, "rolling back migration");
+        self.conn.lock().unwrap().execute_batch(down_sql)?;
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM schema_migrations WHERE version = ?1",
+            params![version],
+        )?;
+        tracing::info!(version = version, "migration rolled back successfully");
+        Ok(())
+    }
+
+    /// Returns the sorted list of user table/index names currently in the
+    /// database (excluding sqlite-internal objects). Used by migration
+    /// rollback tests to compare schema snapshots before/after a
+    /// rollback + re-apply cycle.
+    #[cfg(test)]
+    pub(crate) fn schema_object_names(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Returns `(column_name, column_type)` pairs for `table`, ordered by
+    /// column position. Used by migration rollback tests to compare table
+    /// schemas before/after a rollback + re-apply cycle.
+    #[cfg(test)]
+    pub(crate) fn table_columns(&self, table: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
     pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
         let channels_json = serde_json::to_string(&prefs.channels).unwrap();
         self.conn.lock().unwrap().execute(
@@ -1205,6 +1335,22 @@ impl Db {
             })
         })?;
         Ok(row)
+    }
+
+    /// Reads the raw `normalized_frequency` column for `vault_id`. Only used
+    /// by migration rollback tests to verify the data-transformation
+    /// migration (version "10") correctly backfills this column.
+    #[cfg(test)]
+    pub(crate) fn get_normalized_frequency(
+        &self,
+        vault_id: u64,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT normalized_frequency FROM reminder_preferences WHERE vault_id = ?1",
+            params![vault_id.cast_signed()],
+            |r| r.get(0),
+        )
     }
 
     pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {

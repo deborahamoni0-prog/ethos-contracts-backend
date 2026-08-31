@@ -124,8 +124,21 @@ fn is_valid_transition(from: CredentialState, to: CredentialState) -> bool {
 // ── Core functions ────────────────────────────────────────────────────────────
 
 /// Initialize a credential with Draft state.
+///
+/// No-op if the credential already has a state — re-initializing would reset a
+/// Revoked/Archived (terminal) credential back to Draft and "revive" it.
 pub fn init_credential_state(env: &Env, credential_id: u64) {
     let key = CredentialLifecycleKey::CredentialState(credential_id);
+    // Never overwrite an existing state: this is what keeps terminal states
+    // (Revoked/Archived) permanent, even via the init entry point.
+    if env
+        .storage()
+        .persistent()
+        .get::<CredentialLifecycleKey, CredentialState>(&key)
+        .is_some()
+    {
+        return;
+    }
     env.storage()
         .persistent()
         .set(&key, &CredentialState::Draft);
@@ -164,8 +177,14 @@ pub fn transition_credential_state(
 ) -> bool {
     let current = get_credential_state(env, credential_id);
 
+    // Terminal states (Revoked/Archived) are permanent — hard-block every
+    // outbound transition here so the invariant holds even if the transition
+    // table changes. This prevents a credential from being "revived" after
+    // revocation or archival.
+    let valid = !is_terminal_state(current) && is_valid_transition(current, new_state);
+
     // Check if transition is valid
-    if !is_valid_transition(current, new_state) {
+    if !valid {
         env.events().publish(
             (CREDENTIAL_STATE_INVALID_TOPIC, credential_id),
             InvalidStateTransitionEvent {
@@ -319,6 +338,30 @@ mod tests {
         assert!(is_terminal_state(CredentialState::Archived));
         assert!(!is_terminal_state(CredentialState::Active));
         assert!(!is_terminal_state(CredentialState::Draft));
+    }
+
+    #[test]
+    fn test_terminal_states_block_all_outbound_transitions() {
+        // Exhaustive: every target state must be rejected from Revoked/Archived,
+        // including same-state and Draft (the "revival" vector).
+        let all_states = [
+            CredentialState::Draft,
+            CredentialState::Active,
+            CredentialState::Suspended,
+            CredentialState::Revoked,
+            CredentialState::Expired,
+            CredentialState::Archived,
+        ];
+        for to in all_states {
+            assert!(
+                !is_valid_transition(CredentialState::Revoked, to),
+                "Revoked -> {to:?} must be rejected"
+            );
+            assert!(
+                !is_valid_transition(CredentialState::Archived, to),
+                "Archived -> {to:?} must be rejected"
+            );
+        }
     }
 
     #[test]

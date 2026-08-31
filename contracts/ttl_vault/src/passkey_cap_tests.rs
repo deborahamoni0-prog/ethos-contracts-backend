@@ -19,14 +19,24 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger as _},
+    testutils::{Address as _, Events, Ledger},
     token::StellarAssetClient,
     Address, BytesN, Env, IntoVal, String, TryIntoVal, Vec,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn setup(env: &Env) -> (Address, Address, Address, TtlVaultContractClient<'_>) {
+fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
+    let env = Env::default();
+
+    // These cap-boundary tests drive enough lifecycle/check-in operations to
+    // push the capped Vecs (MAX_PASSKEY_*_ENTRIES = 1000) to and past their
+    // limits. Each `Vec::remove(0)` is O(n), so the loop is O(n²) and blows the
+    // small default soroban test budget well before the production cap logic is
+    // reached. Lift the budget when building the test environment so the tests
+    // actually exercise cap enforcement instead of dying in the harness.
+    env.budget().reset_unlimited();
+
     env.mock_all_auths();
     env.budget().reset_unlimited();
 
@@ -361,8 +371,7 @@ fn test_passkey_audit_events_emitted_past_cap() {
         .count();
 
     assert_eq!(
-        total_audit_events as u32,
-        1,
+        total_audit_events as u32, expected_events,
         "every lifecycle operation must emit a pk_audit event regardless of on-chain pruning"
     );
 }

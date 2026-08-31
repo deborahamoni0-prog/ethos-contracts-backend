@@ -542,6 +542,158 @@ mod tests {
         assert!(!result.passed());
     }
 
+    /// #370: cache unavailability + one replica down simultaneously. Rather
+    /// than erroring outright, a caller using `fallback::cascade` should
+    /// route around both down targets to the next healthy one.
+    #[test]
+    fn cascading_cache_and_replica_failure_falls_back_gracefully() {
+        use crate::fallback::{cascade, FallbackChain, FallbackTarget};
+
+        let sim = NetworkPartitionSimulator::new();
+        sim.partition("cache");
+        sim.partition("replica-b");
+        // "primary-db" is left healthy.
+
+        let chain = FallbackChain {
+            id: "test-chain".to_string(),
+            name: "vault-read".to_string(),
+            resource: "vault:read".to_string(),
+            targets: vec![
+                FallbackTarget {
+                    name: "cache".to_string(),
+                    endpoint: "cache://local".to_string(),
+                    priority: 0,
+                },
+                FallbackTarget {
+                    name: "replica-b".to_string(),
+                    endpoint: "replica://b".to_string(),
+                    priority: 1,
+                },
+                FallbackTarget {
+                    name: "primary-db".to_string(),
+                    endpoint: "db://primary".to_string(),
+                    priority: 2,
+                },
+            ],
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+
+        let result = cascade(&chain, |target| sim.call("client", &target.name));
+
+        // Falls back instead of erroring: a resolved target is found even
+        // though the two highest-priority targets are both down.
+        assert_eq!(result.resolved_target, Some("db://primary".to_string()));
+        assert!(
+            result.degraded,
+            "should be reported as degraded since it didn't resolve on the first target"
+        );
+        assert_eq!(result.attempts.len(), 3);
+        assert!(!result.attempts[0].succeeded, "cache should be down");
+        assert!(!result.attempts[1].succeeded, "replica-b should be down");
+        assert!(result.attempts[2].succeeded, "primary-db should be reachable");
+
+        // Recovery: healing cache should let the chain resolve on the
+        // highest-priority target again, no longer degraded.
+        sim.heal("cache");
+        let recovered = cascade(&chain, |target| sim.call("client", &target.name));
+        assert_eq!(recovered.resolved_target, Some("cache://local".to_string()));
+        assert!(!recovered.degraded);
+    }
+
+    /// #370: circuit breaker + bulkhead interacting under concurrent load.
+    /// The bulkhead bounds concurrency/queueing to a downstream dependency;
+    /// the circuit breaker should additionally fast-reject calls once it
+    /// trips, without either mechanism panicking or deadlocking under load.
+    #[tokio::test]
+    async fn circuit_breaker_and_bulkhead_interact_under_load() {
+        use crate::bulkhead::{BulkheadConfig, BulkheadRegistry};
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+        use std::sync::Arc;
+
+        let registry = Arc::new(BulkheadRegistry::new(BulkheadConfig {
+            max_concurrent: 3,
+            max_queue_size: 4,
+        }));
+        let breaker = Arc::new(CircuitBreaker::new(
+            "downstream-dep",
+            CircuitBreakerConfig {
+                failure_threshold: 4,
+                success_threshold: 2,
+                open_duration: Duration::from_secs(30),
+            },
+        ));
+
+        let bulkhead_permits_acquired = Arc::new(AtomicUsize::new(0));
+        let operation_invocations = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let registry = Arc::clone(&registry);
+            let breaker = Arc::clone(&breaker);
+            let bulkhead_permits_acquired = Arc::clone(&bulkhead_permits_acquired);
+            let operation_invocations = Arc::clone(&operation_invocations);
+            handles.push(tokio::spawn(async move {
+                match registry.acquire("/api/vault-dependency").await {
+                    Ok(_permit) => {
+                        bulkhead_permits_acquired.fetch_add(1, Ordering::SeqCst);
+                        // Simulate call latency while holding the slot.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        breaker
+                            .call(|| {
+                                operation_invocations.fetch_add(1, Ordering::SeqCst);
+                                Err::<(), &str>("simulated downstream failure")
+                            })
+                            .map_err(|_| ())
+                    }
+                    Err(_queue_full) => Err(()),
+                }
+            }));
+        }
+
+        let mut rejected_or_failed = 0;
+        for handle in handles {
+            // A panic in the spawned task surfaces here as an `Err` from
+            // `join` — exactly the "did the system crash under combined
+            // load" signal a chaos scenario needs to catch.
+            let outcome = handle.await.expect("task panicked under concurrent load");
+            if outcome.is_err() {
+                rejected_or_failed += 1;
+            }
+        }
+
+        assert_eq!(
+            rejected_or_failed, 20,
+            "every call should have failed or been rejected (operation always fails)"
+        );
+        assert_eq!(
+            breaker.state(),
+            CircuitState::Open,
+            "breaker should trip open under sustained failures"
+        );
+
+        let acquired = bulkhead_permits_acquired.load(Ordering::SeqCst);
+        let invoked = operation_invocations.load(Ordering::SeqCst);
+        assert!(
+            acquired >= 4,
+            "test needs at least failure_threshold calls to reach the breaker to prove it trips, got {acquired}"
+        );
+        assert!(
+            invoked < acquired,
+            "circuit breaker should have fast-rejected at least one call that made it past the \
+             bulkhead instead of invoking the operation every time (invoked={invoked}, acquired={acquired})"
+        );
+
+        // No permits leaked: bulkhead accounting should be back to zero
+        // active once every task has completed.
+        let snapshot = registry.metrics_snapshot();
+        let bulkhead_stats = snapshot
+            .iter()
+            .find(|s| s.endpoint == "/api/vault-dependency")
+            .expect("endpoint should have been recorded");
+        assert_eq!(bulkhead_stats.active, 0, "all bulkhead permits should have been released");
+    }
+
     #[test]
     fn chaos_report_aggregates_multiple_scenarios() {
         let mut report = ChaosReport::new();

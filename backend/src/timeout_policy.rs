@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// a single request, bounded by `TimeoutState::max_override_ms`.
 pub const TIMEOUT_OVERRIDE_HEADER: &str = "x-timeout-override-ms";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeoutPolicy {
     pub id: String,
     pub endpoint_pattern: String,
@@ -36,6 +36,17 @@ pub struct TimeoutPolicy {
 pub struct CreateTimeoutPolicyRequest {
     pub endpoint_pattern: String,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TimeoutPolicyError {
+    #[error("requested timeout {requested_ms}ms exceeds maximum override cap {max_override_ms}ms")]
+    OverrideTooHigh {
+        requested_ms: u64,
+        max_override_ms: u64,
+    },
+    #[error("timeout_ms must be > 0")]
+    ZeroTimeout,
 }
 
 #[derive(Debug, Default)]
@@ -61,10 +72,20 @@ impl TimeoutPolicyStore {
         }
     }
 
-    pub fn upsert(&self, policy: TimeoutPolicy) -> TimeoutPolicy {
+    /// Upsert a timeout policy, validating that `timeout_ms` does not exceed `max_override_ms` (#365).
+    pub fn upsert(&self, policy: TimeoutPolicy) -> Result<TimeoutPolicy, TimeoutPolicyError> {
+        if policy.timeout_ms == 0 {
+            return Err(TimeoutPolicyError::ZeroTimeout);
+        }
+        if policy.timeout_ms > self.max_override_ms {
+            return Err(TimeoutPolicyError::OverrideTooHigh {
+                requested_ms: policy.timeout_ms,
+                max_override_ms: self.max_override_ms,
+            });
+        }
         let mut guard = self.policies.lock().unwrap();
         guard.insert(policy.id.clone(), policy.clone());
-        policy
+        Ok(policy)
     }
 
     pub fn get(&self, id: &str) -> Option<TimeoutPolicy> {
@@ -111,6 +132,14 @@ impl TimeoutPolicyStore {
     pub fn violation_count(&self) -> u64 {
         self.violations.total.load(Ordering::SeqCst)
     }
+
+    pub fn max_override_ms(&self) -> u64 {
+        self.max_override_ms
+    }
+
+    pub fn default_timeout_ms(&self) -> u64 {
+        self.default_timeout_ms
+    }
 }
 
 #[derive(Clone)]
@@ -149,8 +178,10 @@ async fn create_timeout_policy(
         timeout_ms: body.timeout_ms,
         created_at: chrono::Utc::now(),
     };
-    let saved = state.store.upsert(policy);
-    Ok((StatusCode::CREATED, Json(saved)))
+    match state.store.upsert(policy) {
+        Ok(saved) => Ok((StatusCode::CREATED, Json(saved))),
+        Err(err) => Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string())),
+    }
 }
 
 async fn list_timeout_policies(State(state): State<TimeoutState>) -> Json<Vec<TimeoutPolicy>> {
@@ -224,18 +255,22 @@ mod tests {
     #[test]
     fn resolve_timeout_prefers_most_specific_policy() {
         let store = TimeoutPolicyStore::new(30_000, 120_000);
-        store.upsert(TimeoutPolicy {
-            id: "a".into(),
-            endpoint_pattern: "/api".into(),
-            timeout_ms: 5_000,
-            created_at: chrono::Utc::now(),
-        });
-        store.upsert(TimeoutPolicy {
-            id: "b".into(),
-            endpoint_pattern: "/api/vaults".into(),
-            timeout_ms: 15_000,
-            created_at: chrono::Utc::now(),
-        });
+        store
+            .upsert(TimeoutPolicy {
+                id: "a".into(),
+                endpoint_pattern: "/api".into(),
+                timeout_ms: 5_000,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        store
+            .upsert(TimeoutPolicy {
+                id: "b".into(),
+                endpoint_pattern: "/api/vaults".into(),
+                timeout_ms: 15_000,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
         assert_eq!(store.resolve_timeout_ms("/api/vaults/1"), 15_000);
     }
 
@@ -245,5 +280,70 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(TIMEOUT_OVERRIDE_HEADER, "999999".parse().unwrap());
         assert_eq!(store.apply_override(30_000, &headers), 60_000);
+    }
+
+    #[test]
+    fn upsert_at_cap_is_accepted() {
+        let store = TimeoutPolicyStore::new(30_000, 60_000);
+        let res = store.upsert(TimeoutPolicy {
+            id: "at-cap".into(),
+            endpoint_pattern: "/api/at-cap".into(),
+            timeout_ms: 60_000,
+            created_at: chrono::Utc::now(),
+        });
+        assert!(res.is_ok());
+        assert_eq!(store.resolve_timeout_ms("/api/at-cap"), 60_000);
+    }
+
+    #[test]
+    fn upsert_above_cap_is_rejected_with_distinct_error() {
+        let store = TimeoutPolicyStore::new(30_000, 60_000);
+        let res = store.upsert(TimeoutPolicy {
+            id: "too-high".into(),
+            endpoint_pattern: "/api/too-high".into(),
+            timeout_ms: 60_001,
+            created_at: chrono::Utc::now(),
+        });
+        assert_eq!(
+            res,
+            Err(TimeoutPolicyError::OverrideTooHigh {
+                requested_ms: 60_001,
+                max_override_ms: 60_000,
+            })
+        );
+        // Ensure the invalid policy was not inserted
+        assert_eq!(store.resolve_timeout_ms("/api/too-high"), 30_000);
+    }
+
+    #[test]
+    fn upsert_zero_timeout_rejected() {
+        let store = TimeoutPolicyStore::new(30_000, 60_000);
+        let res = store.upsert(TimeoutPolicy {
+            id: "zero".into(),
+            endpoint_pattern: "/api/zero".into(),
+            timeout_ms: 0,
+            created_at: chrono::Utc::now(),
+        });
+        assert_eq!(res, Err(TimeoutPolicyError::ZeroTimeout));
+    }
+
+    #[test]
+    fn regression_test_enforcement_path_protects_against_excess_timeout() {
+        let store = TimeoutPolicyStore::new(10_000, 50_000);
+
+        // Attempting to install multiple policies above cap must all fail
+        for bad_ms in [50_001, 100_000, 1_000_000, u64::MAX] {
+            let err = store.upsert(TimeoutPolicy {
+                id: format!("bad_{bad_ms}"),
+                endpoint_pattern: "/api/critical".into(),
+                timeout_ms: bad_ms,
+                created_at: chrono::Utc::now(),
+            });
+            assert!(matches!(err, Err(TimeoutPolicyError::OverrideTooHigh { .. })));
+        }
+
+        // The endpoint continues to safely resolve to default timeout
+        assert_eq!(store.resolve_timeout_ms("/api/critical"), 10_000);
+        assert_eq!(store.list().len(), 0);
     }
 }
